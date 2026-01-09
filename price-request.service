@@ -1,0 +1,28 @@
+[Unit]
+Description=Price Request Generator - Automatisation des demandes de prix
+Documentation=https://github.com/your-repo/price-request-app
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+WorkingDirectory=/chemin/vers/price-request-app
+ExecStart=/usr/bin/node /chemin/vers/price-request-app/dist/main.js
+Restart=on-failure
+RestartSec=10
+
+# Logs
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=price-request
+
+# Environnement
+Environment=NODE_ENV=production
+Environment=APP_PORT=3000
+
+# Sécurité
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

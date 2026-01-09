@@ -1,0 +1,797 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Révision des Demandes de Prix</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: #f5f7fa;
+            color: #333;
+            line-height: 1.6;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
+        }
+        
+        header h1 {
+            font-size: 1.8rem;
+            margin-bottom: 5px;
+        }
+        
+        header p {
+            opacity: 0.9;
+        }
+        
+        .stats {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .stat-card {
+            background: white;
+            padding: 15px 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+            flex: 1;
+        }
+        
+        .stat-card h3 {
+            font-size: 2rem;
+            color: #667eea;
+        }
+        
+        .stat-card p {
+            color: #666;
+            font-size: 0.9rem;
+        }
+        
+        .stat-card.warning h3 {
+            color: #f5a623;
+        }
+        
+        .draft-list {
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+            overflow: hidden;
+        }
+        
+        .draft-list-header {
+            background: #f8f9fa;
+            padding: 15px 20px;
+            border-bottom: 1px solid #eee;
+            font-weight: 600;
+        }
+        
+        .draft-item {
+            padding: 15px 20px;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        
+        .draft-item:hover {
+            background: #f8f9fa;
+        }
+        
+        .draft-item:last-child {
+            border-bottom: none;
+        }
+        
+        .draft-info h4 {
+            color: #333;
+            margin-bottom: 5px;
+        }
+        
+        .draft-info p {
+            color: #666;
+            font-size: 0.85rem;
+        }
+        
+        .badge {
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        
+        .badge.warning {
+            background: #fff3cd;
+            color: #856404;
+        }
+        
+        .badge.success {
+            background: #d4edda;
+            color: #155724;
+        }
+        
+        /* Modal / Détail */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.5);
+            z-index: 1000;
+            overflow-y: auto;
+        }
+        
+        .modal.active {
+            display: block;
+        }
+        
+        .modal-content {
+            background: white;
+            margin: 20px auto;
+            max-width: 1200px;
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+        }
+        
+        .modal-header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .modal-header h2 {
+            font-size: 1.3rem;
+        }
+        
+        .close-btn {
+            background: rgba(255,255,255,0.2);
+            border: none;
+            color: white;
+            width: 35px;
+            height: 35px;
+            border-radius: 50%;
+            cursor: pointer;
+            font-size: 1.2rem;
+        }
+        
+        .modal-body {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0;
+            min-height: 600px;
+        }
+        
+        .pdf-viewer {
+            background: #f0f0f0;
+            border-right: 1px solid #ddd;
+        }
+        
+        .pdf-viewer iframe {
+            width: 100%;
+            height: 600px;
+            border: none;
+        }
+        
+        .pdf-placeholder {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 600px;
+            color: #666;
+        }
+        
+        .pdf-placeholder svg {
+            width: 80px;
+            height: 80px;
+            margin-bottom: 15px;
+            opacity: 0.5;
+        }
+        
+        .items-editor {
+            padding: 20px;
+            overflow-y: auto;
+            max-height: 600px;
+        }
+        
+        .items-editor h3 {
+            margin-bottom: 15px;
+            color: #333;
+        }
+        
+        .item-card {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 15px;
+            border-left: 4px solid #667eea;
+        }
+        
+        .item-card.needs-review {
+            border-left-color: #f5a623;
+            background: #fffbf0;
+        }
+        
+        .item-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+        
+        .form-group {
+            margin-bottom: 10px;
+        }
+        
+        .form-group label {
+            display: block;
+            font-size: 0.8rem;
+            color: #666;
+            margin-bottom: 3px;
+        }
+        
+        .form-group input,
+        .form-group textarea {
+            width: 100%;
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 0.9rem;
+        }
+        
+        .form-group input:focus,
+        .form-group textarea:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+        
+        .form-group input.highlight {
+            border-color: #f5a623;
+            background: #fffbf0;
+        }
+        
+        .item-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+            margin-top: 10px;
+        }
+        
+        .btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+        
+        .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            background: #5a6fd6;
+        }
+        
+        .btn-success {
+            background: #28a745;
+            color: white;
+        }
+        
+        .btn-success:hover {
+            background: #218838;
+        }
+        
+        .btn-danger {
+            background: #dc3545;
+            color: white;
+        }
+        
+        .btn-danger:hover {
+            background: #c82333;
+        }
+        
+        .btn-outline {
+            background: transparent;
+            border: 1px solid #667eea;
+            color: #667eea;
+        }
+        
+        .btn-outline:hover {
+            background: #667eea;
+            color: white;
+        }
+        
+        .modal-footer {
+            padding: 15px 20px;
+            background: #f8f9fa;
+            border-top: 1px solid #eee;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .add-item-btn {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            padding: 10px 15px;
+            background: #e9ecef;
+            border: 2px dashed #adb5bd;
+            border-radius: 8px;
+            cursor: pointer;
+            color: #666;
+            margin-top: 10px;
+        }
+        
+        .add-item-btn:hover {
+            background: #dee2e6;
+            border-color: #667eea;
+            color: #667eea;
+        }
+        
+        .alert {
+            padding: 12px 15px;
+            border-radius: 5px;
+            margin-bottom: 15px;
+        }
+        
+        .alert-warning {
+            background: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeeba;
+        }
+        
+        .alert-info {
+            background: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+        
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #666;
+        }
+        
+        .empty-state svg {
+            width: 100px;
+            height: 100px;
+            margin-bottom: 20px;
+            opacity: 0.3;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+        
+        @media (max-width: 900px) {
+            .modal-body {
+                grid-template-columns: 1fr;
+            }
+            
+            .pdf-viewer {
+                border-right: none;
+                border-bottom: 1px solid #ddd;
+            }
+            
+            .stats {
+                flex-wrap: wrap;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>📋 Révision des Demandes de Prix</h1>
+            <p>Vérifiez et complétez les informations extraites automatiquement</p>
+        </header>
+        
+        <div class="stats" id="stats">
+            <div class="stat-card warning">
+                <h3 id="stat-pending">-</h3>
+                <p>En attente de révision</p>
+            </div>
+            <div class="stat-card">
+                <h3 id="stat-reviewed">-</h3>
+                <p>Révisées</p>
+            </div>
+            <div class="stat-card">
+                <h3 id="stat-sent">-</h3>
+                <p>Envoyées</p>
+            </div>
+            <div class="stat-card">
+                <h3 id="stat-total">-</h3>
+                <p>Total</p>
+            </div>
+        </div>
+        
+        <div class="draft-list">
+            <div class="draft-list-header">
+                ⚠️ Demandes nécessitant une vérification manuelle
+            </div>
+            <div id="draft-list-content">
+                <div class="loading">Chargement...</div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Modal de révision -->
+    <div class="modal" id="review-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="modal-title">Révision - </h2>
+                <button class="close-btn" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="pdf-viewer" id="pdf-viewer">
+                    <div class="pdf-placeholder">
+                        <svg viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z"/>
+                            <polyline points="14 2 14 8 20 8"/>
+                        </svg>
+                        <p>PDF non disponible</p>
+                    </div>
+                </div>
+                <div class="items-editor" id="items-editor">
+                    <div class="alert alert-warning">
+                        ⚠️ <strong>Vérification requise</strong> - Ce document a été extrait par OCR. 
+                        Veuillez vérifier les quantités et compléter les informations manquantes.
+                    </div>
+                    <h3>Articles à vérifier</h3>
+                    <div id="items-list"></div>
+                    <button class="add-item-btn" onclick="addNewItem()">
+                        <span>+</span> Ajouter un article
+                    </button>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <div>
+                    <label>
+                        <input type="checkbox" id="confirm-review"> 
+                        Je confirme avoir vérifié toutes les informations
+                    </label>
+                </div>
+                <div>
+                    <button class="btn btn-outline" onclick="closeModal()">Annuler</button>
+                    <button class="btn btn-primary" onclick="saveChanges()">Enregistrer</button>
+                    <button class="btn btn-success" onclick="approveAndSend()" id="approve-btn" disabled>
+                        ✓ Approuver et Envoyer
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentDraftId = null;
+        let currentItems = [];
+        
+        // Charger les statistiques
+        async function loadStats() {
+            try {
+                const res = await fetch('/api/review/stats');
+                const data = await res.json();
+                if (data.success) {
+                    document.getElementById('stat-pending').textContent = data.stats.pendingReview;
+                    document.getElementById('stat-reviewed').textContent = data.stats.reviewed;
+                    document.getElementById('stat-sent').textContent = data.stats.sent;
+                    document.getElementById('stat-total').textContent = data.stats.total;
+                }
+            } catch (e) {
+                console.error('Erreur chargement stats:', e);
+            }
+        }
+        
+        // Charger les drafts en attente
+        async function loadPendingDrafts() {
+            const container = document.getElementById('draft-list-content');
+            
+            try {
+                const res = await fetch('/api/review/pending');
+                const data = await res.json();
+                
+                if (!data.success || data.count === 0) {
+                    container.innerHTML = `
+                        <div class="empty-state">
+                            <svg viewBox="0 0 24 24" fill="currentColor">
+                                <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>
+                            </svg>
+                            <h3>Aucune demande en attente</h3>
+                            <p>Toutes les demandes ont été vérifiées.</p>
+                        </div>
+                    `;
+                    return;
+                }
+                
+                container.innerHTML = data.drafts.map(draft => `
+                    <div class="draft-item" onclick="openReview('${draft.id}')">
+                        <div class="draft-info">
+                            <h4>${draft.clientRfqNumber || draft.internalRfqNumber}</h4>
+                            <p>
+                                ${draft.clientName || 'Client inconnu'} • 
+                                ${new Date(draft.createdAt).toLocaleDateString('fr-FR')} •
+                                Extraction: ${draft.extractionMethod || 'inconnue'}
+                            </p>
+                        </div>
+                        <span class="badge warning">À vérifier</span>
+                    </div>
+                `).join('');
+                
+            } catch (e) {
+                console.error('Erreur chargement drafts:', e);
+                container.innerHTML = '<div class="loading">Erreur de chargement</div>';
+            }
+        }
+        
+        // Ouvrir la modal de révision
+        async function openReview(draftId) {
+            currentDraftId = draftId;
+            document.getElementById('review-modal').classList.add('active');
+            document.getElementById('items-list').innerHTML = '<div class="loading">Chargement...</div>';
+            
+            try {
+                const res = await fetch(`/api/review/${draftId}`);
+                const data = await res.json();
+                
+                if (!data.success) {
+                    throw new Error('Erreur chargement');
+                }
+                
+                document.getElementById('modal-title').textContent = 
+                    `Révision - ${data.draft.clientRfqNumber || data.draft.internalRfqNumber}`;
+                
+                // Afficher le PDF si disponible
+                const pdfViewer = document.getElementById('pdf-viewer');
+                if (data.originalPdfUrl) {
+                    pdfViewer.innerHTML = `<iframe src="${data.originalPdfUrl}"></iframe>`;
+                } else {
+                    pdfViewer.innerHTML = `
+                        <div class="pdf-placeholder">
+                            <svg viewBox="0 0 24 24" fill="currentColor">
+                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z"/>
+                                <polyline points="14 2 14 8 20 8"/>
+                            </svg>
+                            <p>PDF original non disponible</p>
+                        </div>
+                    `;
+                }
+                
+                // Afficher les items
+                currentItems = data.items || [];
+                renderItems();
+                
+            } catch (e) {
+                console.error('Erreur:', e);
+                document.getElementById('items-list').innerHTML = 
+                    '<div class="alert alert-warning">Erreur de chargement des données</div>';
+            }
+        }
+        
+        // Afficher les items
+        function renderItems() {
+            const container = document.getElementById('items-list');
+            
+            if (currentItems.length === 0) {
+                container.innerHTML = '<p>Aucun article. Cliquez sur "Ajouter un article" pour commencer.</p>';
+                return;
+            }
+            
+            container.innerHTML = currentItems.map((item, idx) => `
+                <div class="item-card ${item.needsManualReview || item.isEstimated ? 'needs-review' : ''}" data-index="${idx}">
+                    <div class="item-row">
+                        <div class="form-group">
+                            <label>Description *</label>
+                            <textarea rows="2" 
+                                onchange="updateItem(${idx}, 'description', this.value)"
+                            >${item.description || ''}</textarea>
+                        </div>
+                        <div class="form-group">
+                            <label>Code fournisseur</label>
+                            <input type="text" 
+                                value="${item.supplierCode || ''}" 
+                                placeholder="Ex: HTM-56-4T"
+                                onchange="updateItem(${idx}, 'supplierCode', this.value)">
+                        </div>
+                    </div>
+                    <div class="item-row">
+                        <div class="form-group">
+                            <label>Quantité * ${item.isEstimated ? '⚠️' : ''}</label>
+                            <input type="number" 
+                                value="${item.quantity || 1}" 
+                                min="1"
+                                class="${item.isEstimated ? 'highlight' : ''}"
+                                onchange="updateItem(${idx}, 'quantity', parseInt(this.value))">
+                        </div>
+                        <div class="form-group">
+                            <label>Unité</label>
+                            <input type="text" 
+                                value="${item.unit || 'pcs'}" 
+                                placeholder="pcs, kg, m..."
+                                onchange="updateItem(${idx}, 'unit', this.value)">
+                        </div>
+                    </div>
+                    <div class="item-row">
+                        <div class="form-group">
+                            <label>Marque</label>
+                            <input type="text" 
+                                value="${item.brand || ''}" 
+                                placeholder="Ex: KOMATSU, SKF..."
+                                onchange="updateItem(${idx}, 'brand', this.value)">
+                        </div>
+                        <div class="form-group">
+                            <label>Référence interne</label>
+                            <input type="text" 
+                                value="${item.internalCode || ''}" 
+                                placeholder="Code interne client"
+                                onchange="updateItem(${idx}, 'internalCode', this.value)">
+                        </div>
+                    </div>
+                    <div class="item-actions">
+                        ${currentItems.length > 1 ? `
+                            <button class="btn btn-danger" onclick="removeItem(${idx})">
+                                Supprimer
+                            </button>
+                        ` : ''}
+                    </div>
+                </div>
+            `).join('');
+        }
+        
+        // Mettre à jour un item
+        function updateItem(index, field, value) {
+            if (currentItems[index]) {
+                currentItems[index][field] = value;
+                currentItems[index].needsManualReview = false;
+                currentItems[index].isEstimated = false;
+            }
+        }
+        
+        // Ajouter un nouvel item
+        function addNewItem() {
+            currentItems.push({
+                id: 'new_' + Date.now(),
+                description: '',
+                quantity: 1,
+                unit: 'pcs',
+                needsManualReview: true,
+            });
+            renderItems();
+        }
+        
+        // Supprimer un item
+        function removeItem(index) {
+            if (currentItems.length > 1) {
+                currentItems.splice(index, 1);
+                renderItems();
+            }
+        }
+        
+        // Sauvegarder les modifications
+        async function saveChanges() {
+            // Valider
+            for (const item of currentItems) {
+                if (!item.description || item.description.trim().length < 3) {
+                    alert('Chaque article doit avoir une description');
+                    return;
+                }
+                if (!item.quantity || item.quantity <= 0) {
+                    alert('Chaque article doit avoir une quantité positive');
+                    return;
+                }
+            }
+            
+            try {
+                const res = await fetch(`/api/review/${currentDraftId}/items`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ items: currentItems }),
+                });
+                
+                const data = await res.json();
+                if (data.success) {
+                    alert('Modifications enregistrées');
+                } else {
+                    throw new Error(data.message);
+                }
+            } catch (e) {
+                alert('Erreur: ' + e.message);
+            }
+        }
+        
+        // Approuver et envoyer
+        async function approveAndSend() {
+            if (!document.getElementById('confirm-review').checked) {
+                alert('Veuillez confirmer avoir vérifié les informations');
+                return;
+            }
+            
+            // Sauvegarder d'abord
+            await saveChanges();
+            
+            try {
+                const res = await fetch(`/api/review/${currentDraftId}/approve`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ reviewNotes: 'Révisé manuellement' }),
+                });
+                
+                const data = await res.json();
+                if (data.success) {
+                    alert('Demande approuvée et envoyée!');
+                    closeModal();
+                    loadPendingDrafts();
+                    loadStats();
+                } else {
+                    throw new Error(data.message);
+                }
+            } catch (e) {
+                alert('Erreur: ' + e.message);
+            }
+        }
+        
+        // Fermer la modal
+        function closeModal() {
+            document.getElementById('review-modal').classList.remove('active');
+            currentDraftId = null;
+            currentItems = [];
+            document.getElementById('confirm-review').checked = false;
+        }
+        
+        // Activer/désactiver le bouton d'approbation
+        document.getElementById('confirm-review').addEventListener('change', function() {
+            document.getElementById('approve-btn').disabled = !this.checked;
+        });
+        
+        // Fermer modal en cliquant à l'extérieur
+        document.getElementById('review-modal').addEventListener('click', function(e) {
+            if (e.target === this) {
+                closeModal();
+            }
+        });
+        
+        // Initialisation
+        loadStats();
+        loadPendingDrafts();
+        
+        // Rafraîchir toutes les 30 secondes
+        setInterval(() => {
+            loadStats();
+            loadPendingDrafts();
+        }, 30000);
+    </script>
+</body>
+</html>

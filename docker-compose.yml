@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  price-request:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: price-request-generator
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      # Persister la base de données
+      - ./data:/app/data
+      # Persister les fichiers générés
+      - ./output:/app/output
+      # Logs
+      - ./logs:/app/logs
+    environment:
+      - NODE_ENV=production
+      - APP_PORT=3000
+      # Configuration IMAP
+      - IMAP_HOST=${IMAP_HOST}
+      - IMAP_PORT=${IMAP_PORT}
+      - IMAP_USER=${IMAP_USER}
+      - IMAP_PASSWORD=${IMAP_PASSWORD}
+      - IMAP_TLS=${IMAP_TLS}
+      # Configuration SMTP
+      - SMTP_HOST=${SMTP_HOST}
+      - SMTP_PORT=${SMTP_PORT}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - SMTP_SECURE=${SMTP_SECURE}
+      # Autres
+      - DRAFTS_FOLDER=${DRAFTS_FOLDER}
+      - DB_PATH=/app/data/price-request.db
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
