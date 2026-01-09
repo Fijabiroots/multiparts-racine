@@ -53,12 +53,29 @@ let PriceRequestService = PriceRequestService_1 = class PriceRequestService {
             const additionalAttachments = email.attachments.filter((att) => {
                 const lowerType = att.contentType.toLowerCase();
                 const lowerName = att.filename?.toLowerCase() || '';
-                if (lowerName.includes('outlook-') || lowerName.includes('outlook_') ||
-                    lowerName.startsWith('image') || lowerName.match(/^cid:/i)) {
+                if (/^outlook[-_]/i.test(lowerName)) {
+                    return false;
+                }
+                if (/^image\d+\./i.test(lowerName)) {
+                    return false;
+                }
+                if (/^cid:/i.test(lowerName) || /^cid[-_]/i.test(lowerName)) {
+                    return false;
+                }
+                if (/^(signature|logo|footer|banner|header)[-_\d]*\./i.test(lowerName)) {
+                    return false;
+                }
+                if (/^[a-f0-9]{8,}[-_]/i.test(lowerName) || /^~[A-Z]{3}\d+/i.test(lowerName)) {
+                    return false;
+                }
+                if (/^att\d+\./i.test(lowerName) || lowerName === 'winmail.dat') {
+                    return false;
+                }
+                if (att.size && att.size < 5000 && lowerType.includes('image')) {
                     return false;
                 }
                 return lowerType.includes('image') ||
-                    /\.(jpg|jpeg|png|gif|bmp|webp)$/i.test(lowerName) ||
+                    /\.(jpg|jpeg|png|gif|bmp|webp|tiff?)$/i.test(lowerName) ||
                     /\.(doc|docx|xls|xlsx)$/i.test(lowerName);
             });
             let extractedData = [];

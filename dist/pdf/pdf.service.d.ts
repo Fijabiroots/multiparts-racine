@@ -7,6 +7,7 @@ export declare class PdfService {
     private extractPRNumber;
     private extractAdditionalInfo;
     private extractPurchaseRequisitionItems;
+    private cleanDescription;
     private extractSupplierCodeFromDescription;
     private extractBrandFromDescription;
     private extractBrandFromText;

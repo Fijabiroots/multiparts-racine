@@ -75,21 +75,59 @@ export class PriceRequestService {
       
       // Pièces jointes complémentaires (images, etc.) à inclure dans le brouillon
       const additionalAttachments = email.attachments.filter(
-  (att) => {
-    const lowerType = att.contentType.toLowerCase();
-    const lowerName = att.filename?.toLowerCase() || '';
-    
-    // Ignorer les images de signature Outlook
-    if (lowerName.includes('outlook-') || lowerName.includes('outlook_') || 
-        lowerName.startsWith('image') || lowerName.match(/^cid:/i)) {
-      return false;
-    }
-    
-    return lowerType.includes('image') ||
-           /\.(jpg|jpeg|png|gif|bmp|webp)$/i.test(lowerName) ||
-           /\.(doc|docx|xls|xlsx)$/i.test(lowerName);
-  },
-);
+        (att) => {
+          const lowerType = att.contentType.toLowerCase();
+          const lowerName = att.filename?.toLowerCase() || '';
+
+          // =====================================================
+          // Filtrer les images de signature/inline Outlook
+          // Ces images polluent les fichiers Excel avec des entrées inutiles
+          // Patterns connus: outlook-xxx.png, image001.png, cid:xxx, etc.
+          // =====================================================
+
+          // Pattern 1: Images Outlook explicites (outlook-xxx.png, Outlook_xxx.jpg)
+          if (/^outlook[-_]/i.test(lowerName)) {
+            return false;
+          }
+
+          // Pattern 2: Images génériques inline (image001.png, image002.jpg)
+          if (/^image\d+\./i.test(lowerName)) {
+            return false;
+          }
+
+          // Pattern 3: CID (Content-ID) references
+          if (/^cid:/i.test(lowerName) || /^cid[-_]/i.test(lowerName)) {
+            return false;
+          }
+
+          // Pattern 4: Images de signature courantes (signature.png, logo.png, footer.png)
+          if (/^(signature|logo|footer|banner|header)[-_\d]*\./i.test(lowerName)) {
+            return false;
+          }
+
+          // Pattern 5: Images avec ID hexadécimaux (souvent générées automatiquement)
+          // Ex: "a1b2c3d4-e5f6-7890.png" ou "~WRL0001.tmp"
+          if (/^[a-f0-9]{8,}[-_]/i.test(lowerName) || /^~[A-Z]{3}\d+/i.test(lowerName)) {
+            return false;
+          }
+
+          // Pattern 6: Images inline Microsoft (ATT00001.png, winmail.dat content)
+          if (/^att\d+\./i.test(lowerName) || lowerName === 'winmail.dat') {
+            return false;
+          }
+
+          // Pattern 7: Très petites images (probablement icônes/spacers) - vérifier si disponible
+          // Si la taille est disponible et < 5KB, probablement une icône
+          if (att.size && att.size < 5000 && lowerType.includes('image')) {
+            return false;
+          }
+
+          // Accepter les vraies pièces jointes utiles
+          return lowerType.includes('image') ||
+                 /\.(jpg|jpeg|png|gif|bmp|webp|tiff?)$/i.test(lowerName) ||
+                 /\.(doc|docx|xls|xlsx)$/i.test(lowerName);
+        },
+      );
 
       let extractedData: ExtractedPdfData[] = [];
       let itemsFromBody: PriceRequestItem[] = [];
