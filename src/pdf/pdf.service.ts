@@ -160,6 +160,7 @@ export class PdfService {
     const lines = cleanText.split('\n');
 
     this.logger.debug(`Analyse de ${lines.length} lignes pour extraction items`);
+    this.logger.debug(`Premiers 500 chars du texte: ${cleanText.substring(0, 500)}`);
 
     // Extraire les infos additionnelles pour la marque
     const additionalInfo = this.extractAdditionalInfo(text);
@@ -168,64 +169,149 @@ export class PdfService {
     const detectedBrand = brandFromAdditional || brandFromGeneral;
 
     // =====================================================
-    // MÉTHODE PRINCIPALE: Pattern global pour Endeavour Mining
-    // Format: Line Qty UOM ItemCode Description... GLCode Cost Cost
+    // MÉTHODE PRINCIPALE: Pattern pour Endeavour Mining
+    // Format PDF original: Line | Qty | UOM | ItemCode | Description | GLCode | Cost
     // Exemple: "10 10 EA 201368 RELAY OVERLOAD... 1500405 0 0"
+    //
+    // PROBLÈME: pdf-parse extrait SANS ESPACES entre colonnes:
+    // "1010EA201368RELAY OVERLOAD THERMAL 17-25A1500405 0 0"
+    //
+    // SOLUTION: Utiliser l'unité (EA/PCS) comme ancre et parser autour
     // =====================================================
 
     // Map pour stocker les items trouvés (éviter doublons)
     const foundItems: Map<string, { qty: number; unit: string; desc: string; lineNum: string }> = new Map();
 
-    // Pattern pour les lignes principales
-    // Format avec espaces: "10 10 EA 201368 RELAY..."
-    // Format sans espaces (pdf-parse): "1010EA201368RELAY..."
-    const mainLinePattern = /\b(\d{1,2})(\d{1,4})(EA|PCS|PC|KG|M|L|SET|UNIT|LOT)(\d{5,8})([A-Z][A-Z0-9\s\-\.\/\&\,\(\)]+?)(?:\s*1500\d+|\s+\d+\s*USD|\s*$)/gi;
-    
-    // Pattern alternatif avec espaces
-    const spacedPattern = /\b(\d{1,3})\s+(\d+)\s+(EA|PCS|PC|KG|M|L|SET|UNIT|LOT)\s+(\d{5,8})\s+([A-Z][A-Z0-9\s\-\.\/\&\,\(\)]+?)(?:\s+1500\d+|\s+\d+\s+\d+\s*(USD|EUR|XOF)?|\s*$)/gi;
+    // Liste des unités supportées
+    const UNITS = 'EA|PCS|PC|KG|M|L|SET|UNIT|LOT|EACH|PIECE|PIECES';
+
+    // =====================================================
+    // Pattern 1: Format COMPACT (pdf-parse sans espaces)
+    // Ex: "1010EA201368RELAY OVERLOAD..." -> Line=10, Qty=10, Unit=EA, Code=201368
+    // L'astuce: on cherche l'unité, puis on parse les chiffres avant comme Qty
+    // et après comme ItemCode
+    // =====================================================
+
+    // Pattern: (optionnel: 1-3 chiffres pour line)(1-4 chiffres pour qty)(UNIT)(5-8 chiffres pour code)(Description)
+    // On utilise une approche différente: chercher UNIT suivi de code item
+    const compactPattern = new RegExp(
+      `(\\d{1,4})(${UNITS})(\\d{5,8})([A-Z][A-Z0-9\\s\\-\\.\\/\\&\\,\\(\\)\\:]+?)` +
+      `(?:\\s*1500\\d+|\\s+\\d+\\s+\\d+\\s*(?:USD|EUR|XOF)?|\\s*$)`,
+      'gi'
+    );
 
     let match;
-    
-    // Essayer d'abord le pattern sans espaces (pdf-parse compacte souvent le texte)
-    while ((match = mainLinePattern.exec(cleanText)) !== null) {
-      const lineNum = match[1];
-      const qty = parseInt(match[2], 10);
-      const unit = match[3];
-      const itemCode = match[4];
-      let description = match[5].trim();
+
+    // Essayer le pattern compact
+    while ((match = compactPattern.exec(cleanText)) !== null) {
+      const qtyAndLine = match[1]; // Contient potentiellement "LineQty" collés
+      const unit = match[2].toUpperCase();
+      const itemCode = match[3];
+      let description = match[4].trim();
+
+      // Parser la quantité depuis qtyAndLine
+      // Logique: si le nombre est <= 4 chiffres, c'est probablement "LineQty" collés
+      // On prend les derniers 1-3 chiffres comme quantité (car qty est généralement 1-999)
+      let qty: number;
+      if (qtyAndLine.length <= 2) {
+        // Juste la quantité (1-99)
+        qty = parseInt(qtyAndLine, 10);
+      } else if (qtyAndLine.length === 3) {
+        // Peut être "1" + "10" ou "10" + "1" ou juste "100"
+        // Heuristique: si ça commence par 1-9, prendre les 2 derniers chiffres comme qty
+        qty = parseInt(qtyAndLine.slice(-2), 10) || parseInt(qtyAndLine, 10);
+      } else {
+        // 4 chiffres: "10" + "10" -> prendre les 2 derniers
+        qty = parseInt(qtyAndLine.slice(-2), 10) || parseInt(qtyAndLine.slice(-3), 10);
+      }
+
+      // Fallback si qty semble invalide
+      if (qty <= 0 || qty > 9999) {
+        qty = parseInt(qtyAndLine, 10) || 1;
+      }
 
       // Nettoyer la description
-      description = description.replace(/\s*1500\d+.*$/i, '').trim();
-      description = description.replace(/\s+\d+\s+\d+\s*(USD|EUR|XOF)?.*$/i, '').trim();
-      description = description.replace(/\s+0\s+0\s*$/i, '').trim();
-      description = description.replace(/\s+\d+\s*USD.*$/i, '').trim();
-      description = description.replace(/\s{2,}/g, ' ').trim();
+      description = this.cleanDescription(description);
 
       if (description.length > 5 && !foundItems.has(itemCode)) {
-        foundItems.set(itemCode, { qty, unit, desc: description, lineNum });
-        this.logger.debug(`Item trouvé (compact): Code=${itemCode}, Qty=${qty}, Desc="${description.substring(0, 50)}..."`);
+        foundItems.set(itemCode, { qty, unit, desc: description, lineNum: '0' });
+        this.logger.debug(`Item compact: Code=${itemCode}, Qty=${qty}, Unit=${unit}, Desc="${description.substring(0, 50)}..."`);
       }
     }
-    
-    // Si rien trouvé, essayer le pattern avec espaces
+
+    // =====================================================
+    // Pattern 2: Format ESPACÉ (PDF bien formaté)
+    // Ex: "10 10 EA 201368 RELAY OVERLOAD..."
+    // =====================================================
     if (foundItems.size === 0) {
+      const spacedPattern = new RegExp(
+        `\\b(\\d{1,3})\\s+(\\d+)\\s+(${UNITS})\\s+(\\d{5,8})\\s+([A-Z][A-Z0-9\\s\\-\\.\\/\\&\\,\\(\\)\\:]+?)` +
+        `(?:\\s+1500\\d+|\\s+\\d+\\s+\\d+\\s*(?:USD|EUR|XOF)?|\\s*$)`,
+        'gi'
+      );
+
       while ((match = spacedPattern.exec(cleanText)) !== null) {
         const lineNum = match[1];
         const qty = parseInt(match[2], 10);
-        const unit = match[3];
+        const unit = match[3].toUpperCase();
         const itemCode = match[4];
         let description = match[5].trim();
 
-        // Nettoyer la description
-        description = description.replace(/\s+1500\d+.*$/i, '').trim();
-        description = description.replace(/\s+\d+\s+\d+\s*(USD|EUR|XOF)?.*$/i, '').trim();
-        description = description.replace(/\s+0\s+0\s*$/i, '').trim();
-        description = description.replace(/\s{2,}/g, ' ').trim();
+        description = this.cleanDescription(description);
 
         if (description.length > 5 && !foundItems.has(itemCode)) {
           foundItems.set(itemCode, { qty, unit, desc: description, lineNum });
-          this.logger.debug(`Item trouvé (espacé): Code=${itemCode}, Qty=${qty}, Desc="${description.substring(0, 50)}..."`);
+          this.logger.debug(`Item espacé: Code=${itemCode}, Qty=${qty}, Unit=${unit}, Desc="${description.substring(0, 50)}..."`);
         }
+      }
+    }
+
+    // =====================================================
+    // Pattern 3: Format alternatif - chercher ItemCode + Description
+    // Pour les PDFs avec format différent
+    // Ex: "201368 - RELAY OVERLOAD THERMAL 17-25A" ou "Part: 201368 Desc: RELAY..."
+    // =====================================================
+    if (foundItems.size === 0) {
+      const altPatterns = [
+        // ItemCode suivi de description avec tiret
+        /\b(\d{5,8})\s*[-–]\s*([A-Z][A-Z0-9\s\-\.\/\&\,\(\)\:]+)/gi,
+        // Qty x Description avec code
+        /(\d+)\s*[xX×]\s*([A-Z][A-Z0-9\s\-\.\/\&\,\(\)\:]+?)\s+(?:REF|PN|P\/N|CODE)[:\s]*(\d{5,8})/gi,
+        // Code au début de ligne avec quantité
+        /^(\d{5,8})\s+([A-Z][A-Z0-9\s\-\.\/\&\,\(\)\:]+?)\s+(\d+)\s*(EA|PCS|PC|KG|M|L|SET|UNIT|LOT)?/gim,
+      ];
+
+      for (const pattern of altPatterns) {
+        while ((match = pattern.exec(cleanText)) !== null) {
+          let itemCode: string;
+          let description: string;
+          let qty = 1;
+
+          if (pattern.source.includes('[xX×]')) {
+            // Pattern "Qty x Description CODE"
+            qty = parseInt(match[1], 10);
+            description = match[2].trim();
+            itemCode = match[3];
+          } else if (pattern.source.startsWith('^')) {
+            // Pattern "CODE Description Qty"
+            itemCode = match[1];
+            description = match[2].trim();
+            qty = parseInt(match[3], 10) || 1;
+          } else {
+            // Pattern "CODE - Description"
+            itemCode = match[1];
+            description = match[2].trim();
+          }
+
+          description = this.cleanDescription(description);
+
+          if (description.length > 5 && !foundItems.has(itemCode)) {
+            foundItems.set(itemCode, { qty, unit: 'EA', desc: description, lineNum: '0' });
+            this.logger.debug(`Item alt: Code=${itemCode}, Qty=${qty}, Desc="${description.substring(0, 50)}..."`);
+          }
+        }
+
+        if (foundItems.size > 0) break;
       }
     }
 
@@ -335,6 +421,29 @@ export class PdfService {
 
     this.logger.log(`Extraction terminée: ${items.length} items trouvés`);
     return items;
+  }
+
+  /**
+   * Nettoie une description en supprimant les codes GL, devises, et autres parasites
+   */
+  private cleanDescription(description: string): string {
+    let cleaned = description;
+
+    // Supprimer les codes GL (1500xxx)
+    cleaned = cleaned.replace(/\s*1500\d+.*$/i, '').trim();
+
+    // Supprimer les prix et devises
+    cleaned = cleaned.replace(/\s+\d+\s+\d+\s*(USD|EUR|XOF)?.*$/i, '').trim();
+    cleaned = cleaned.replace(/\s+\d+\s*(USD|EUR|XOF).*$/i, '').trim();
+    cleaned = cleaned.replace(/\s+0\s+0\s*$/i, '').trim();
+
+    // Supprimer les chiffres isolés à la fin (souvent des codes)
+    cleaned = cleaned.replace(/\s+\d{6,}\s*$/i, '').trim();
+
+    // Normaliser les espaces multiples
+    cleaned = cleaned.replace(/\s{2,}/g, ' ').trim();
+
+    return cleaned;
   }
 
   private extractSupplierCodeFromDescription(description: string): string | undefined {
