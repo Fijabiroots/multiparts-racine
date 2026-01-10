@@ -152,15 +152,58 @@ export class PdfService {
     return result;
   }
 
+  /**
+   * Parse Line et Qty combinés (ex: "1010" -> Line=10, Qty=10)
+   */
+  private parseLineAndQty(combined: string): { line: number; qty: number } {
+    const num = parseInt(combined, 10);
+    const len = combined.length;
+
+    if (len === 1) {
+      // "5" -> qty=5
+      return { line: 0, qty: num };
+    }
+    if (len === 2) {
+      // "10" -> probablement juste qty=10
+      return { line: 0, qty: num };
+    }
+    if (len === 3) {
+      // "110" -> line=1, qty=10 ou line=11, qty=0
+      // Heuristique: si premier chiffre < 5, c'est probablement line + qty
+      const firstDigit = parseInt(combined[0], 10);
+      if (firstDigit <= 3) {
+        return { line: firstDigit, qty: parseInt(combined.slice(1), 10) };
+      }
+      // Sinon qty=110 ou autre interprétation
+      return { line: 0, qty: num };
+    }
+    if (len === 4) {
+      // "1010" -> line=10, qty=10 (le cas le plus courant)
+      const line = parseInt(combined.slice(0, 2), 10);
+      const qty = parseInt(combined.slice(2), 10);
+      return { line, qty };
+    }
+    if (len === 5) {
+      // "10100" -> line=10, qty=100 ou line=101, qty=00
+      // Prendre les 2 premiers comme line, le reste comme qty
+      return { line: parseInt(combined.slice(0, 2), 10), qty: parseInt(combined.slice(2), 10) };
+    }
+    // Plus de 5 chiffres: probablement line=2-3 premiers, qty=reste
+    return { line: parseInt(combined.slice(0, 2), 10), qty: parseInt(combined.slice(2), 10) || 1 };
+  }
+
   private extractPurchaseRequisitionItems(text: string): PriceRequestItem[] {
     const items: PriceRequestItem[] = [];
 
-    // Normaliser le texte
+    // Normaliser le texte - garder tout sur une ligne pour pattern matching
     const cleanText = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    // Version sans newlines pour les patterns qui matchent sur plusieurs colonnes
+    const singleLineText = cleanText.replace(/\n+/g, ' ').replace(/\s{2,}/g, ' ');
     const lines = cleanText.split('\n');
 
     this.logger.debug(`Analyse de ${lines.length} lignes pour extraction items`);
-    this.logger.debug(`Premiers 500 chars du texte: ${cleanText.substring(0, 500)}`);
+    this.logger.debug(`Premiers 1000 chars du texte: ${cleanText.substring(0, 1000)}`);
+    this.logger.debug(`Texte single-line (500 chars): ${singleLineText.substring(0, 500)}`);
 
     // Extraire les infos additionnelles pour la marque
     const additionalInfo = this.extractAdditionalInfo(text);
@@ -174,9 +217,9 @@ export class PdfService {
     // Exemple: "10 10 EA 201368 RELAY OVERLOAD... 1500405 0 0"
     //
     // PROBLÈME: pdf-parse extrait SANS ESPACES entre colonnes:
-    // "1010EA201368RELAY OVERLOAD THERMAL 17-25A1500405 0 0"
+    // "1010EA201368RELAY OVERLOAD THERMAL 17-25A CLASS 10A SCHNEIDER LRD3251500405 0 0"
     //
-    // SOLUTION: Utiliser l'unité (EA/PCS) comme ancre et parser autour
+    // SOLUTION: Utiliser le GL Code (1500xxx) comme ancre de fin
     // =====================================================
 
     // Map pour stocker les items trouvés (éviter doublons)
@@ -186,56 +229,67 @@ export class PdfService {
     const UNITS = 'EA|PCS|PC|KG|M|L|SET|UNIT|LOT|EACH|PIECE|PIECES';
 
     // =====================================================
-    // Pattern 1: Format COMPACT (pdf-parse sans espaces)
-    // Ex: "1010EA201368RELAY OVERLOAD..." -> Line=10, Qty=10, Unit=EA, Code=201368
-    // L'astuce: on cherche l'unité, puis on parse les chiffres avant comme Qty
-    // et après comme ItemCode
+    // Pattern 0: Format ULTRA-COMPACT avec GL Code comme fin explicite
+    // Ex: "1010EA201368RELAY OVERLOAD...LRD3251500405"
+    // La clé: 1500xxx est TOUJOURS le GL Code
     // =====================================================
 
-    // Pattern: (optionnel: 1-3 chiffres pour line)(1-4 chiffres pour qty)(UNIT)(5-8 chiffres pour code)(Description)
-    // On utilise une approche différente: chercher UNIT suivi de code item
-    const compactPattern = new RegExp(
-      `(\\d{1,4})(${UNITS})(\\d{5,8})([A-Z][A-Z0-9\\s\\-\\.\\/\\&\\,\\(\\)\\:]+?)` +
-      `(?:\\s*1500\\d+|\\s+\\d+\\s+\\d+\\s*(?:USD|EUR|XOF)?|\\s*$)`,
+    this.logger.debug('=== Essai Pattern 0: Ultra-compact avec GL Code ===');
+
+    // Pattern qui capture tout jusqu'au GL Code (1500xxx)
+    const ultraCompactPattern = new RegExp(
+      `(\\d{2,5})(${UNITS})(\\d{5,8})([A-Z][A-Z0-9\\s\\-\\.\\/\\&\\,\\(\\)\\:]+?)(1500\\d{3,})`,
       'gi'
     );
 
     let match;
 
-    // Essayer le pattern compact
-    while ((match = compactPattern.exec(cleanText)) !== null) {
-      const qtyAndLine = match[1]; // Contient potentiellement "LineQty" collés
+    while ((match = ultraCompactPattern.exec(singleLineText)) !== null) {
+      const lineQty = match[1];
       const unit = match[2].toUpperCase();
       const itemCode = match[3];
       let description = match[4].trim();
+      const glCode = match[5];
 
-      // Parser la quantité depuis qtyAndLine
-      // Logique: si le nombre est <= 4 chiffres, c'est probablement "LineQty" collés
-      // On prend les derniers 1-3 chiffres comme quantité (car qty est généralement 1-999)
-      let qty: number;
-      if (qtyAndLine.length <= 2) {
-        // Juste la quantité (1-99)
-        qty = parseInt(qtyAndLine, 10);
-      } else if (qtyAndLine.length === 3) {
-        // Peut être "1" + "10" ou "10" + "1" ou juste "100"
-        // Heuristique: si ça commence par 1-9, prendre les 2 derniers chiffres comme qty
-        qty = parseInt(qtyAndLine.slice(-2), 10) || parseInt(qtyAndLine, 10);
-      } else {
-        // 4 chiffres: "10" + "10" -> prendre les 2 derniers
-        qty = parseInt(qtyAndLine.slice(-2), 10) || parseInt(qtyAndLine.slice(-3), 10);
-      }
-
-      // Fallback si qty semble invalide
-      if (qty <= 0 || qty > 9999) {
-        qty = parseInt(qtyAndLine, 10) || 1;
-      }
+      // Parser Line et Qty
+      const { qty } = this.parseLineAndQty(lineQty);
 
       // Nettoyer la description
       description = this.cleanDescription(description);
 
-      if (description.length > 5 && !foundItems.has(itemCode)) {
+      if (description.length > 5 && qty > 0 && !foundItems.has(itemCode)) {
         foundItems.set(itemCode, { qty, unit, desc: description, lineNum: '0' });
-        this.logger.debug(`Item compact: Code=${itemCode}, Qty=${qty}, Unit=${unit}, Desc="${description.substring(0, 50)}..."`);
+        this.logger.debug(`Item ultra-compact: Code=${itemCode}, Qty=${qty}, Unit=${unit}, GL=${glCode}, Desc="${description.substring(0, 50)}..."`);
+      }
+    }
+
+    // =====================================================
+    // Pattern 1: Format COMPACT sans GL Code visible
+    // Fallback si Pattern 0 ne trouve rien
+    // =====================================================
+    if (foundItems.size === 0) {
+      this.logger.debug('=== Essai Pattern 1: Compact standard ===');
+
+      const compactPattern = new RegExp(
+        `(\\d{1,4})(${UNITS})(\\d{5,8})([A-Z][A-Z0-9\\s\\-\\.\\/\\&\\,\\(\\)\\:]+?)` +
+        `(?:1500\\d+|\\s+\\d+\\s+\\d+\\s*(?:USD|EUR|XOF)?|\\s*$)`,
+        'gi'
+      );
+
+      while ((match = compactPattern.exec(singleLineText)) !== null) {
+        const qtyAndLine = match[1];
+        const unit = match[2].toUpperCase();
+        const itemCode = match[3];
+        let description = match[4].trim();
+
+        const { qty } = this.parseLineAndQty(qtyAndLine);
+
+        description = this.cleanDescription(description);
+
+        if (description.length > 5 && qty > 0 && !foundItems.has(itemCode)) {
+          foundItems.set(itemCode, { qty, unit, desc: description, lineNum: '0' });
+          this.logger.debug(`Item compact: Code=${itemCode}, Qty=${qty}, Unit=${unit}, Desc="${description.substring(0, 50)}..."`);
+        }
       }
     }
 
@@ -244,6 +298,8 @@ export class PdfService {
     // Ex: "10 10 EA 201368 RELAY OVERLOAD..."
     // =====================================================
     if (foundItems.size === 0) {
+      this.logger.debug('=== Essai Pattern 2: Format espacé ===');
+
       const spacedPattern = new RegExp(
         `\\b(\\d{1,3})\\s+(\\d+)\\s+(${UNITS})\\s+(\\d{5,8})\\s+([A-Z][A-Z0-9\\s\\-\\.\\/\\&\\,\\(\\)\\:]+?)` +
         `(?:\\s+1500\\d+|\\s+\\d+\\s+\\d+\\s*(?:USD|EUR|XOF)?|\\s*$)`,
@@ -381,16 +437,91 @@ export class PdfService {
       }
     }
 
+    // =====================================================
+    // Pattern 4: Format SIMPLE ITY (sans ItemCode)
+    // pdf-parse extrait: "103EA\nSeat cover Hilux Dual Cab\n203EA\n..."
+    // Format: LineQtyUOM sur une ligne, Description sur la ligne suivante
+    // =====================================================
+    if (items.length === 0) {
+      this.logger.debug('=== Essai Pattern 4: Format simple ITY (sans ItemCode) ===');
+
+      // Pattern pour format ITY: LineQtyUOM puis Description sur ligne suivante
+      // Ex: "103EA\nSeat cover Hilux Dual Cab" -> Line=10, Qty=3, UOM=EA
+      for (let i = 0; i < lines.length - 1; i++) {
+        const currentLine = lines[i].trim();
+        const nextLine = lines[i + 1]?.trim() || '';
+
+        // Pattern: 2-3 chiffres (line+qty combinés) + UOM collé
+        // Ex: "103EA" = Line 10, Qty 3, EA
+        // Ex: "5010EA" = Line 50, Qty 10, EA
+        const lineQtyUomMatch = currentLine.match(new RegExp(`^(\\d{2,4})(${UNITS})$`, 'i'));
+
+        if (lineQtyUomMatch && nextLine.length > 5 && /^[A-Z]/i.test(nextLine)) {
+          const combined = lineQtyUomMatch[1];
+          const unit = lineQtyUomMatch[2].toUpperCase();
+
+          // Parser le combined: les 2 premiers chiffres sont le Line, le reste est Qty
+          // 103 -> Line=10, Qty=3
+          // 203 -> Line=20, Qty=3
+          // 505 -> Line=50, Qty=5
+          let lineNum: string;
+          let qty: number;
+
+          if (combined.length === 3) {
+            // "103" -> Line=10, Qty=3
+            lineNum = combined.substring(0, 2);
+            qty = parseInt(combined.substring(2), 10);
+          } else if (combined.length === 4) {
+            // "5010" -> Line=50, Qty=10
+            lineNum = combined.substring(0, 2);
+            qty = parseInt(combined.substring(2), 10);
+          } else {
+            // Fallback
+            lineNum = combined.substring(0, 2);
+            qty = parseInt(combined.substring(2), 10) || 1;
+          }
+
+          // Vérifier que qty est valide
+          if (qty > 0 && qty < 10000) {
+            let description = nextLine;
+
+            // Nettoyer la description
+            description = this.cleanDescription(description);
+
+            const itemKey = `LINE-${lineNum}`;
+
+            if (!foundItems.has(itemKey) && description.length > 5) {
+              foundItems.set(itemKey, { qty, unit, desc: description, lineNum });
+              this.logger.debug(`Item ITY simple: Line=${lineNum}, Qty=${qty}, Unit=${unit}, Desc="${description.substring(0, 50)}..."`);
+            }
+          }
+        }
+      }
+
+      // Convertir les items trouvés
+      for (const [itemKey, data] of foundItems) {
+        const brand = detectedBrand || this.extractBrandFromDescription(data.desc);
+
+        items.push({
+          reference: itemKey,
+          description: data.desc,
+          quantity: data.qty,
+          unit: data.unit === 'EA' ? 'pcs' : data.unit.toLowerCase(),
+          brand: brand,
+        });
+      }
+    }
+
     // Si aucun item trouvé, essayer méthode alternative ligne par ligne
     if (items.length === 0) {
       this.logger.debug('Méthode principale sans résultat, essai méthode alternative');
-      
+
       for (const line of lines) {
         const trimmed = line.trim();
-        
-        // Pattern alternatif
+
+        // Pattern alternatif avec ItemCode
         const altMatch = trimmed.match(/^(\d{1,2})\s+(\d+)\s+(EA|PCS|PC|KG|M|L|SET|UNIT)\s+(\d{5,6})\s+([A-Z].+)/i);
-        
+
         if (altMatch) {
           const qty = parseInt(altMatch[2], 10);
           const unit = altMatch[3];
@@ -416,6 +547,32 @@ export class PdfService {
             });
           }
         }
+
+        // Pattern alternatif SANS ItemCode (format simple)
+        const simpleAltMatch = trimmed.match(/^(\d{1,3})\s+(\d+)\s+(EA|PCS|PC|KG|M|L|SET|UNIT)\s+([A-Z][A-Za-z0-9\s\-\.\/\&\,\(\)\:]+)/i);
+
+        if (simpleAltMatch && !altMatch) {
+          const lineNum = simpleAltMatch[1];
+          const qty = parseInt(simpleAltMatch[2], 10);
+          const unit = simpleAltMatch[3];
+          let description = simpleAltMatch[4].trim();
+
+          // Nettoyer
+          description = this.cleanDescription(description);
+
+          const itemKey = `LINE-${lineNum}`;
+          if (description.length > 5 && !items.some(i => i.reference === itemKey)) {
+            const brand = detectedBrand || this.extractBrandFromDescription(description);
+
+            items.push({
+              reference: itemKey,
+              brand: brand,
+              description: description,
+              quantity: qty,
+              unit: unit === 'EA' ? 'pcs' : unit.toLowerCase(),
+            });
+          }
+        }
       }
     }
 
@@ -429,7 +586,13 @@ export class PdfService {
   private cleanDescription(description: string): string {
     let cleaned = description;
 
-    // Supprimer les codes GL (1500xxx)
+    // IMPORTANT: Gérer le cas où le GL Code (1500xxx) est collé à la description
+    // Ex: "...SCHNEIDER LRD3251500405" -> "...SCHNEIDER LRD325"
+    // Le pattern: [A-Z]+[0-9]+1500xxx -> garder la partie avant 1500
+    cleaned = cleaned.replace(/([A-Z]+\d+)1500\d+.*$/i, '$1').trim();
+
+    // Supprimer les codes GL (1500xxx) avec ou sans espace
+    cleaned = cleaned.replace(/1500\d+.*$/i, '').trim();
     cleaned = cleaned.replace(/\s*1500\d+.*$/i, '').trim();
 
     // Supprimer les prix et devises
@@ -437,7 +600,9 @@ export class PdfService {
     cleaned = cleaned.replace(/\s+\d+\s*(USD|EUR|XOF).*$/i, '').trim();
     cleaned = cleaned.replace(/\s+0\s+0\s*$/i, '').trim();
 
-    // Supprimer les chiffres isolés à la fin (souvent des codes)
+    // Supprimer les chiffres isolés à la fin (souvent des codes GL orphelins)
+    // Mais garder les codes fournisseur (ex: LRD325, 6205-2RS)
+    // Ne supprimer que si c'est un nombre seul > 5 chiffres
     cleaned = cleaned.replace(/\s+\d{6,}\s*$/i, '').trim();
 
     // Normaliser les espaces multiples
