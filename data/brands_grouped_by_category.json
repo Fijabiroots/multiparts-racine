@@ -1,7 +1,7 @@
 {
-  "generated_at_utc": "2026-01-09T13:28:09Z",
+  "generated_at_utc": "2026-01-10T22:53:09Z",
   "source_file": "BRANDS_MULTIPARTS.xlsx",
-  "total_unique_brands": 2179,
+  "total_unique_brands": 2192,
   "categories": [
     {
       "key": "equipements_miniers",
@@ -45,7 +45,10 @@
         "MagnaValves",
         "Marwin Valves",
         "Parker",
-        "Sun Hydraulics"
+        "Sun Hydraulics",
+        "REXROTH",
+        "VICKERS",
+        "MOOG"
       ]
     },
     {
@@ -91,7 +94,15 @@
         "Allison"
       ],
       "brands": [
-        "ZF Friedrichshafen"
+        "ZF Friedrichshafen",
+        "DANA",
+        "SPICER",
+        "CARRARO",
+        "CLARK",
+        "ALLISON",
+        "ZF",
+        "MERITOR",
+        "AXLETECH"
       ]
     },
     {
@@ -111,7 +122,10 @@
         "SKF",
         "Smith Bearing",
         "Timken",
-        "TR Bearing"
+        "TR Bearing",
+        "NTN",
+        "NACHI",
+        "IKO"
       ]
     },
     {
@@ -2248,7 +2262,10 @@
         "Zimmer",
         "Ziton",
         "Zoll",
-        "Zurc"
+        "Zurc",
+        "MANN",
+        "MANN FILTER",
+        "HENGST"
       ]
     }
   ],

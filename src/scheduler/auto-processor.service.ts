@@ -1,10 +1,13 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { DatabaseService } from '../database/database.service';
 import { EmailService } from '../email/email.service';
 import { DetectorService } from '../detector/detector.service';
 import { DocumentParserService } from '../parser/document-parser.service';
 import { ExcelService } from '../excel/excel.service';
 import { DraftService } from '../draft/draft.service';
+import { TrackingService } from '../tracking/tracking.service';
+import { UnifiedIngestionService } from '../ingestion/unified-ingestion.service';
+import { ParseLogService } from '../ingestion/parse-log.service';
 import { ParsedEmail, PriceRequest, PriceRequestItem } from '../common/interfaces';
 import { Client } from '../database/entities';
 
@@ -33,6 +36,9 @@ export interface ProcessResult {
 export class AutoProcessorService {
   private readonly logger = new Logger(AutoProcessorService.name);
 
+  // Flag to use the new unified ingestion pipeline (set to true to enable)
+  private readonly useUnifiedIngestion = true;
+
   constructor(
     private readonly databaseService: DatabaseService,
     private readonly emailService: EmailService,
@@ -40,6 +46,9 @@ export class AutoProcessorService {
     private readonly documentParser: DocumentParserService,
     private readonly excelService: ExcelService,
     private readonly draftService: DraftService,
+    private readonly trackingService: TrackingService,
+    @Optional() private readonly unifiedIngestion?: UnifiedIngestionService,
+    @Optional() private readonly parseLogService?: ParseLogService,
   ) {}
 
   async processNewEmails(options: ProcessOptions): Promise<ProcessResult> {
@@ -57,7 +66,7 @@ export class AutoProcessorService {
         const emails = await this.emailService.fetchEmails({
           folder,
           unseen: true,
-          limit: 50, // Limiter pour éviter surcharge
+          limit: 500, // Augmenté pour traiter tous les emails en attente
         });
 
         this.logger.log(`${emails.length} emails non lus trouvés dans ${folder}`);
@@ -178,33 +187,70 @@ export class AutoProcessorService {
     // 1. Identifier ou créer le client
     const client = await this.findOrCreateClient(email);
 
-    // 2. Parser les documents (pièces jointes + corps email)
-    const parsedDocs = await this.documentParser.parseAllAttachments(email.attachments);
-    const emailBodyData = this.documentParser.parseEmailBody(email.body, email.subject);
-    parsedDocs.push(emailBodyData);
+    // Generate internal RFQ number early (needed for parse log)
+    const internalRfqNumber = this.excelService.generateRequestNumber();
 
-    // 3. Extraire le numéro RFQ client
+    let allItems: PriceRequestItem[] = [];
     let clientRfqNumber: string | undefined;
-    for (const doc of parsedDocs) {
-      if (doc.rfqNumber) {
-        clientRfqNumber = doc.rfqNumber;
-        break;
+    let needsManualReview = false;
+
+    // Use unified ingestion pipeline if available and enabled
+    if (this.useUnifiedIngestion && this.unifiedIngestion) {
+      this.logger.debug('Using unified ingestion pipeline');
+
+      const ingestionResult = await this.unifiedIngestion.processEmail(
+        email,
+        internalRfqNumber
+      );
+
+      allItems = ingestionResult.items;
+      clientRfqNumber = ingestionResult.rfqNumber;
+      needsManualReview = ingestionResult.needsVerification;
+
+      // Log warnings
+      if (ingestionResult.warnings.length > 0) {
+        this.logger.warn(`Ingestion warnings: ${ingestionResult.warnings.join(', ')}`);
       }
-    }
 
-    // 4. Collecter tous les items
-    const allItems: PriceRequestItem[] = [];
-    const seenDescriptions = new Set<string>();
+      // Log summary from parse log
+      if (this.parseLogService) {
+        const summary = this.parseLogService.generateSummary(ingestionResult.parseLog);
+        this.logger.debug(summary);
+      }
+    } else {
+      // Fallback to legacy document parser
+      this.logger.debug('Using legacy document parser');
 
-    for (const doc of parsedDocs) {
-      for (const item of doc.items) {
-        const key = `${item.description.toLowerCase()}-${item.quantity}`;
-        if (!seenDescriptions.has(key)) {
-          seenDescriptions.add(key);
-          allItems.push({
-            ...item,
-            notes: item.notes || `Source: ${doc.filename}`,
-          });
+      // 2. Parser les documents (pièces jointes + corps email)
+      const parsedDocs = await this.documentParser.parseAllAttachments(email.attachments);
+      const emailBodyData = this.documentParser.parseEmailBody(email.body, email.subject);
+      parsedDocs.push(emailBodyData);
+
+      // 3. Extraire le numéro RFQ client
+      for (const doc of parsedDocs) {
+        if (doc.rfqNumber) {
+          clientRfqNumber = doc.rfqNumber;
+          break;
+        }
+      }
+
+      // 4. Collecter tous les items
+      const seenDescriptions = new Set<string>();
+
+      for (const doc of parsedDocs) {
+        for (const item of doc.items) {
+          const key = `${item.description.toLowerCase()}-${item.quantity}`;
+          if (!seenDescriptions.has(key)) {
+            seenDescriptions.add(key);
+            allItems.push({
+              ...item,
+              notes: item.notes || `Source: ${doc.filename}`,
+            });
+          }
+        }
+        // Check if any document needs verification
+        if (doc.needsVerification) {
+          needsManualReview = true;
         }
       }
     }
@@ -218,8 +264,7 @@ export class AutoProcessorService {
       });
     }
 
-    // 5. Générer le numéro RFQ interne
-    const internalRfqNumber = this.excelService.generateRequestNumber();
+    // 5. Le numéro RFQ interne est déjà généré plus haut
 
     // 6. Créer la demande de prix (SANS infos client dans le corps)
     const priceRequest: PriceRequest = {
@@ -229,6 +274,7 @@ export class AutoProcessorService {
       items: allItems,
       notes: `Réf. interne: ${internalRfqNumber}`,
       deadline: this.calculateDeadline(14),
+      needsManualReview,
     };
 
     // 7. Générer le fichier Excel
@@ -314,6 +360,28 @@ export class AutoProcessorService {
       status: 'success',
       message: `Traité avec succès. RFQ interne: ${internalRfqNumber}, RFQ client: ${clientRfqNumber || 'non détecté'}`,
     });
+
+    // 11. Ajouter au fichier de suivi RFQ
+    try {
+      const trackSenderEmail = this.extractEmail(email.from);
+      const trackSenderName = this.extractName(email.from);
+      const trackClientName = client?.name || trackSenderName || this.extractCompanyFromEmail(trackSenderEmail);
+      await this.trackingService.addEntry({
+        timestamp: new Date(),
+        clientRfqNumber,
+        internalRfqNumber,
+        clientName: trackClientName,
+        clientEmail: trackSenderEmail,
+        subject: email.subject,
+        itemCount: allItems.length,
+        status: 'traité',
+        acknowledgmentSent: false,
+        notes: allItems.length + ' article(s) extrait(s)',
+      });
+      this.logger.log('Entrée ajoutée au suivi RFQ: ' + internalRfqNumber);
+    } catch (trackError) {
+      this.logger.warn('Erreur tracking: ' + trackError.message);
+    }
 
     return {
       internalRfqNumber,

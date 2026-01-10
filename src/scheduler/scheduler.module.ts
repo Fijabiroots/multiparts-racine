@@ -9,6 +9,8 @@ import { ParserModule } from '../parser/parser.module';
 import { ExcelModule } from '../excel/excel.module';
 import { DraftModule } from '../draft/draft.module';
 import { MailModule } from '../mail/mail.module';
+import { TrackingModule } from '../tracking/tracking.module';
+import { IngestionModule } from '../ingestion/ingestion.module';
 
 @Module({
   imports: [
@@ -19,6 +21,8 @@ import { MailModule } from '../mail/mail.module';
     ExcelModule,
     DraftModule,
     MailModule,
+    TrackingModule,
+    IngestionModule,
   ],
   providers: [SchedulerService, AutoProcessorService],
   controllers: [SchedulerController],
