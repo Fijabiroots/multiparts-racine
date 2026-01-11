@@ -28,6 +28,16 @@ export class ParseLogBuilder {
   private errors: string[] = [];
   private lineCount = 0;
   private extractionMethod = '';
+  private mergedContinuationLines = 0;
+  private extractionPath?: 'pdfjs_layout' | 'pdf-parse' | 'ocr' | 'mixed';
+  private layoutStats?: {
+    totalPages: number;
+    totalTokens: number;
+    totalRows: number;
+    avgCellsPerRow: number;
+    medianGapX: number;
+  };
+  private unknownBrandCandidates: string[] = [];
 
   constructor(requestId: string) {
     this.requestId = requestId;
@@ -124,6 +134,43 @@ export class ParseLogBuilder {
     this.lineCount = result.items.length;
     this.warnings.push(...result.warnings);
     this.extractionMethod = result.extractionMethod;
+    if (result.mergedContinuationLines !== undefined) {
+      this.mergedContinuationLines = result.mergedContinuationLines;
+    }
+    return this;
+  }
+
+  /**
+   * Set merged continuation lines count
+   */
+  setMergedContinuationLines(count: number): this {
+    this.mergedContinuationLines = count;
+    return this;
+  }
+
+  /**
+   * Set extraction path
+   */
+  setExtractionPath(path: 'pdfjs_layout' | 'pdf-parse' | 'ocr' | 'mixed'): this {
+    this.extractionPath = path;
+    return this;
+  }
+
+  /**
+   * Set layout stats
+   */
+  setLayoutStats(stats: { totalPages: number; totalTokens: number; totalRows: number; avgCellsPerRow: number; medianGapX: number }): this {
+    this.layoutStats = stats;
+    return this;
+  }
+
+  /**
+   * Add unknown brand candidate
+   */
+  addUnknownBrandCandidate(brand: string): this {
+    if (!this.unknownBrandCandidates.includes(brand)) {
+      this.unknownBrandCandidates.push(brand);
+    }
     return this;
   }
 
@@ -154,6 +201,10 @@ export class ParseLogBuilder {
       lineCount: this.lineCount,
       warnings: this.warnings,
       errors: this.errors,
+      mergedContinuationLines: this.mergedContinuationLines,
+      extractionPath: this.extractionPath,
+      layoutStats: this.layoutStats,
+      unknownBrandCandidates: this.unknownBrandCandidates.length > 0 ? this.unknownBrandCandidates : undefined,
       processingTimeMs,
       extractionMethod: this.extractionMethod,
     };
@@ -267,9 +318,36 @@ export class ParseLogService {
 
     lines.push(
       ``,
-      `Lines Extracted: ${log.lineCount}`,
-      ``
+      `Lines Extracted: ${log.lineCount}`
     );
+
+    if (log.mergedContinuationLines && log.mergedContinuationLines > 0) {
+      lines.push(`Merged Continuation Lines: ${log.mergedContinuationLines}`);
+    }
+
+    if (log.extractionPath) {
+      lines.push(`Extraction Path: ${log.extractionPath}`);
+    }
+
+    if (log.layoutStats) {
+      lines.push(
+        `Layout Stats:`,
+        `  Pages: ${log.layoutStats.totalPages}`,
+        `  Tokens: ${log.layoutStats.totalTokens}`,
+        `  Rows: ${log.layoutStats.totalRows}`,
+        `  Avg Cells/Row: ${log.layoutStats.avgCellsPerRow}`,
+        `  Median Gap X: ${log.layoutStats.medianGapX}`
+      );
+    }
+
+    if (log.unknownBrandCandidates && log.unknownBrandCandidates.length > 0) {
+      lines.push(``, `Unknown Brand Candidates: ${log.unknownBrandCandidates.length}`);
+      for (const b of log.unknownBrandCandidates.slice(0, 5)) {
+        lines.push(`  - ${b}`);
+      }
+    }
+
+    lines.push(``);
 
     if (log.warnings.length > 0) {
       lines.push(`Warnings: ${log.warnings.length}`);

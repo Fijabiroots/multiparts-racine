@@ -47,6 +47,7 @@ export interface TableExtractionResult {
   headerDetection: HeaderDetection;
   warnings: string[];
   extractionMethod: 'header-based' | 'heuristic';
+  mergedContinuationLines?: number;
 }
 
 /**
@@ -241,16 +242,21 @@ export class TableParserService implements OnModuleInit {
 
     // 2. Extraire les items
     let items: PriceRequestItem[] = [];
+    let mergedContinuationLines = 0;
 
     if (doc.tables && doc.tables.length > 0) {
       items = this.extractFromTables(doc.tables, headerDetection);
     } else if (doc.rows && doc.rows.length > 0) {
-      items = this.extractFromRows(doc.rows, headerDetection);
+      const result = this.extractFromRows(doc.rows, headerDetection);
+      items = result.items;
+      mergedContinuationLines = result.mergedContinuationLines;
     } else if (doc.rawText) {
-      items = this.extractFromRawText(doc.rawText, headerDetection);
+      const result = this.extractFromRawText(doc.rawText, headerDetection);
+      items = result.items;
+      mergedContinuationLines = result.mergedContinuationLines;
     }
 
-    this.logger.debug(`Extracted ${items.length} raw items from ${doc.sourceName}`);
+    this.logger.debug(`Extracted ${items.length} raw items from ${doc.sourceName} (${mergedContinuationLines} continuation lines merged)`);
 
     // 3. Post-traitement: nettoyage et enrichissement
     items = this.postProcessItems(items);
@@ -260,6 +266,7 @@ export class TableParserService implements OnModuleInit {
       headerDetection,
       warnings,
       extractionMethod: headerDetection.found ? 'header-based' : 'heuristic',
+      mergedContinuationLines,
     };
   }
 
@@ -475,10 +482,13 @@ export class TableParserService implements OnModuleInit {
 
   /**
    * Extrait les items depuis des lignes parsées
+   * Implémente le merge des lignes de continuation (descriptions multilignes)
    */
-  private extractFromRows(rows: ParsedRow[], header: HeaderDetection): PriceRequestItem[] {
+  private extractFromRows(rows: ParsedRow[], header: HeaderDetection): { items: PriceRequestItem[]; mergedContinuationLines: number } {
     const items: PriceRequestItem[] = [];
     const startRow = header.found ? header.lineIndex + 1 : 0;
+    let mergedContinuationLines = 0;
+    let lastItem: PriceRequestItem | null = null;
 
     this.logger.debug(`Extracting from rows starting at ${startRow}, total rows: ${rows.length}`);
 
@@ -490,21 +500,123 @@ export class TableParserService implements OnModuleInit {
 
       const cells = row.cells.length > 1 ? row.cells : this.splitIntoCells(row.raw);
 
+      // Check if this is a continuation line (no qty, no code, just text)
+      if (lastItem && this.isContinuationRow(cells, row.raw)) {
+        // Merge with previous item
+        const continuationText = this.extractContinuationText(cells, row.raw);
+        if (continuationText) {
+          lastItem.description = (lastItem.description + ' ' + continuationText).trim();
+          if (!lastItem.notes) {
+            lastItem.notes = '';
+          }
+          lastItem.notes = (lastItem.notes + '\n[+] ' + continuationText).trim();
+          mergedContinuationLines++;
+          this.logger.debug(`Merged continuation line ${i}: "${continuationText.substring(0, 50)}..."`);
+          continue;
+        }
+      }
+
       if (this.isEmptyDataRow(cells)) continue;
 
       const item = this.extractItemFromCells(cells, header.columns, i);
       if (item) {
         items.push(item);
+        lastItem = item;
       }
     }
 
-    return items;
+    return { items, mergedContinuationLines };
+  }
+
+  /**
+   * Check if a row is a continuation of the previous item (multiline description)
+   * A continuation row typically has:
+   * - No quantity
+   * - No item code/part number
+   * - Contains meaningful text (>= 8 chars)
+   */
+  private isContinuationRow(cells: string[], raw: string): boolean {
+    // Must have some meaningful text
+    const cleanRaw = raw.trim();
+    if (cleanRaw.length < 8) return false;
+
+    // Check if row has a quantity
+    if (this.rowHasQuantity(cells)) return false;
+
+    // Check if row has an item/part code
+    if (this.rowHasCode(cells)) return false;
+
+    // Check if it looks like a new item line (starts with line number)
+    if (/^\d{1,3}\s+/.test(cleanRaw)) return false;
+
+    // Check if it contains significant descriptive text
+    const significantWords = cleanRaw.split(/\s+/).filter(w => w.length >= 3 && !/^\d+$/.test(w));
+    if (significantWords.length < 1) return false;
+
+    // Not a table header
+    const headerKeywords = ['line', 'qty', 'quantity', 'uom', 'item', 'code', 'description', 'stock'];
+    const lowerRaw = cleanRaw.toLowerCase();
+    const matchedHeaders = headerKeywords.filter(h => lowerRaw.includes(h));
+    if (matchedHeaders.length >= 2) return false;
+
+    return true;
+  }
+
+  /**
+   * Check if row contains a quantity value
+   */
+  private rowHasQuantity(cells: string[]): boolean {
+    const QTY_PATTERN = /^\d{1,4}([.,]\d+)?$/;
+
+    for (const cell of cells) {
+      const s = String(cell || '').trim();
+      if (QTY_PATTERN.test(s)) {
+        const num = parseFloat(s.replace(',', '.'));
+        if (num > 0 && num <= 9999) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Check if row contains an item/part code
+   */
+  private rowHasCode(cells: string[]): boolean {
+    const CODE_PATTERN = /^[A-Z0-9][\w\-\/\.]{4,}$/i;
+    const INTERNAL_CODE_PATTERN = /^\d{5,8}$/;
+
+    for (const cell of cells) {
+      const s = String(cell || '').trim();
+      // Item code (alphanumeric, 5+ chars, mixed letters/numbers)
+      if (CODE_PATTERN.test(s) && /\d/.test(s) && /[A-Za-z]/.test(s)) {
+        return true;
+      }
+      // Internal code (5-8 digits)
+      if (INTERNAL_CODE_PATTERN.test(s) && !s.startsWith('1500')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Extract the continuation text from a row
+   */
+  private extractContinuationText(cells: string[], raw: string): string | null {
+    // Join all non-empty cells
+    const nonEmpty = cells.filter(c => String(c || '').trim().length > 0);
+    if (nonEmpty.length > 0) {
+      return nonEmpty.join(' ').trim();
+    }
+    return raw.trim() || null;
   }
 
   /**
    * Extrait les items depuis du texte brut
    */
-  private extractFromRawText(text: string, header: HeaderDetection): PriceRequestItem[] {
+  private extractFromRawText(text: string, header: HeaderDetection): { items: PriceRequestItem[]; mergedContinuationLines: number } {
     const lines = text.split('\n');
     const rows: ParsedRow[] = lines.map((line, idx) => ({
       raw: line,
