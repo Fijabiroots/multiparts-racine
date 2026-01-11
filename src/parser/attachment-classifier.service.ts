@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import * as XLSX from 'xlsx';
+import sharp from 'sharp';
 import { EmailAttachment, PriceRequestItem, ExtractedPdfData } from '../common/interfaces';
 
 /**
@@ -331,9 +332,9 @@ export class AttachmentClassifierService {
   }
 
   /**
-   * Vérifier si c'est une image de signature/logo
+   * Vérifier si c'est une image de signature/logo (sync version, filename/size only)
    */
-  private isSignatureImage(filename: string, size?: number): boolean {
+  isSignatureImage(filename: string, size?: number): boolean {
     const lower = filename.toLowerCase();
 
     // Patterns d'images de signature
@@ -346,6 +347,11 @@ export class AttachmentClassifierService {
       /desc\.(png|jpg|jpeg|gif)$/i,
       /^cid[:\-_]/i,
       /^[a-f0-9]{8,}[-_]/i,
+      /^inline/i,
+      /icon/i,
+      /spacer/i,
+      /pixel/i,
+      /tracking/i,
     ];
 
     for (const pattern of signaturePatterns) {
@@ -356,6 +362,140 @@ export class AttachmentClassifierService {
     if (size && size < 10000) return true;
 
     return false;
+  }
+
+  /**
+   * Advanced image signature detection using sharp for dimensions
+   * Returns { isSignature: boolean, reason: string, dimensions?: { width, height, ratio } }
+   */
+  async isSignatureImageAdvanced(
+    attachment: EmailAttachment
+  ): Promise<{ isSignature: boolean; reason: string; dimensions?: { width: number; height: number; ratio: number } }> {
+    const filename = attachment.filename.toLowerCase();
+
+    // Quick check with filename patterns first
+    if (this.isSignatureImage(filename, attachment.size)) {
+      return { isSignature: true, reason: 'Filename pattern matches signature/logo' };
+    }
+
+    // Only process actual images
+    const imageExtensions = ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.tif', '.webp'];
+    const isImage = imageExtensions.some(ext => filename.endsWith(ext));
+
+    if (!isImage) {
+      return { isSignature: false, reason: 'Not an image file' };
+    }
+
+    // Need content for dimension analysis
+    if (!attachment.content) {
+      return { isSignature: false, reason: 'No content available for analysis' };
+    }
+
+    try {
+      // Get image metadata with sharp
+      const buffer = typeof attachment.content === 'string'
+        ? Buffer.from(attachment.content, 'base64')
+        : attachment.content;
+
+      const metadata = await sharp(buffer).metadata();
+
+      if (!metadata.width || !metadata.height) {
+        return { isSignature: false, reason: 'Could not read image dimensions' };
+      }
+
+      const width = metadata.width;
+      const height = metadata.height;
+      const area = width * height;
+      const ratio = width / height;
+
+      const dimensions = { width, height, ratio: Math.round(ratio * 100) / 100 };
+
+      // Very small area (icons, tracking pixels)
+      if (area < 25000 || (width < 80 && height < 80)) {
+        return {
+          isSignature: true,
+          reason: `Tiny image (${width}x${height}, area=${area})`,
+          dimensions,
+        };
+      }
+
+      // Extreme ratio - banner or spacer
+      if (ratio > 6 || ratio < 0.16) {
+        return {
+          isSignature: true,
+          reason: `Extreme aspect ratio (${ratio.toFixed(2)}) - likely banner/spacer`,
+          dimensions,
+        };
+      }
+
+      // Typical signature banner: wide and short
+      if (width > 600 && height < 200) {
+        return {
+          isSignature: true,
+          reason: `Signature banner dimensions (${width}x${height})`,
+          dimensions,
+        };
+      }
+
+      // Email tracking pixel (1x1 or very small)
+      if ((width === 1 && height === 1) || area < 100) {
+        return {
+          isSignature: true,
+          reason: 'Tracking pixel',
+          dimensions,
+        };
+      }
+
+      // Seems like a legitimate image
+      return {
+        isSignature: false,
+        reason: `Valid image dimensions (${width}x${height})`,
+        dimensions,
+      };
+    } catch (error) {
+      this.logger.debug(`Could not analyze image ${filename}: ${error.message}`);
+      return { isSignature: false, reason: 'Error analyzing image' };
+    }
+  }
+
+  /**
+   * Filter signature images from a list of attachments
+   * Returns filtered list and skipped images with reasons
+   */
+  async filterSignatureImages(
+    attachments: EmailAttachment[]
+  ): Promise<{
+    validImages: EmailAttachment[];
+    skipped: Array<{ attachment: EmailAttachment; reason: string; dimensions?: { width: number; height: number; ratio: number } }>;
+  }> {
+    const validImages: EmailAttachment[] = [];
+    const skipped: Array<{ attachment: EmailAttachment; reason: string; dimensions?: { width: number; height: number; ratio: number } }> = [];
+
+    for (const attachment of attachments) {
+      const filename = attachment.filename.toLowerCase();
+      const imageExtensions = ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.tif', '.webp'];
+      const isImage = imageExtensions.some(ext => filename.endsWith(ext));
+
+      if (!isImage) {
+        validImages.push(attachment);
+        continue;
+      }
+
+      const result = await this.isSignatureImageAdvanced(attachment);
+
+      if (result.isSignature) {
+        skipped.push({
+          attachment,
+          reason: result.reason,
+          dimensions: result.dimensions,
+        });
+        this.logger.debug(`Filtered signature image: ${attachment.filename} - ${result.reason}`);
+      } else {
+        validImages.push(attachment);
+      }
+    }
+
+    return { validImages, skipped };
   }
 
   /**

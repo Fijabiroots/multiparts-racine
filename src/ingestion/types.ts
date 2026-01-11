@@ -47,6 +47,7 @@ export interface FilteredImage {
   reason: FilterReason;
   width?: number;
   height?: number;
+  ratio?: number;
   size?: number;
   ocrText?: string;
 }
