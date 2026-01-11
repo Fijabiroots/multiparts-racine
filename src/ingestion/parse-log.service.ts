@@ -38,6 +38,43 @@ export class ParseLogBuilder {
     medianGapX: number;
   };
   private unknownBrandCandidates: string[] = [];
+  private fallbackTriggered = false;
+  private fallbackReason?: string;
+  private itemsBeforeFallback?: number;
+  private continuationStats?: {
+    itemsWithContinuations: number;
+    maxContinuationsPerItem: number;
+    itemsWithSingleLineQty: number;
+  };
+  private zoneDetection?: {
+    itemsZoneStartLine?: number;
+    itemsZoneEndLine?: number;
+    detectionMethod: 'header-based' | 'keyword-based' | 'heuristic' | 'full-document';
+    zoneLineCount: number;
+  };
+  private headerReappearance?: {
+    repeatedHeadersIgnored: number;
+    repeatedHeaderLines: number[];
+  };
+  private qtyLookahead?: {
+    qtyRecoveredViaLookahead: number;
+    qtyRecoveredViaLookbehind: number;
+  };
+  private specLinesStats?: {
+    specLinesAttached: number;
+    specLinePatterns: string[];
+  };
+  private confidenceStats?: {
+    minConfidence: number;
+    maxConfidence: number;
+    avgConfidence: number;
+    lowConfidenceItemCount: number;
+    needsVerification: boolean;
+  };
+  private postProcessingStats?: {
+    itemsMerged: number;
+    emptyItemsRemoved: number;
+  };
 
   constructor(requestId: string) {
     this.requestId = requestId;
@@ -137,6 +174,44 @@ export class ParseLogBuilder {
     if (result.mergedContinuationLines !== undefined) {
       this.mergedContinuationLines = result.mergedContinuationLines;
     }
+    // Capture fallback information
+    if (result.fallbackTriggered !== undefined) {
+      this.fallbackTriggered = result.fallbackTriggered;
+    }
+    if (result.fallbackReason !== undefined) {
+      this.fallbackReason = result.fallbackReason;
+    }
+    if (result.itemsBeforeFallback !== undefined) {
+      this.itemsBeforeFallback = result.itemsBeforeFallback;
+    }
+    // Capture continuation stats
+    if (result.continuationStats !== undefined) {
+      this.continuationStats = result.continuationStats;
+    }
+    // Capture zone detection
+    if (result.zoneDetection !== undefined) {
+      this.zoneDetection = result.zoneDetection;
+    }
+    // Capture header reappearance
+    if (result.headerReappearance !== undefined) {
+      this.headerReappearance = result.headerReappearance;
+    }
+    // Capture qty lookahead stats
+    if (result.qtyLookahead !== undefined) {
+      this.qtyLookahead = result.qtyLookahead;
+    }
+    // Capture spec lines stats
+    if (result.specLinesStats !== undefined) {
+      this.specLinesStats = result.specLinesStats;
+    }
+    // Capture confidence stats
+    if (result.confidenceStats !== undefined) {
+      this.confidenceStats = result.confidenceStats;
+    }
+    // Capture post-processing stats
+    if (result.postProcessingStats !== undefined) {
+      this.postProcessingStats = result.postProcessingStats;
+    }
     return this;
   }
 
@@ -189,10 +264,15 @@ export class ParseLogBuilder {
       headerScore: this.headerDetection?.score ?? 0,
       headerPage: undefined, // Simplified: page tracking removed
       headerLineIndex: this.headerDetection?.lineIndex,
+      headerRejectionReason: this.headerDetection?.rejectionReason,
+      headerIsFormMetadata: this.headerDetection?.isFormMetadata,
       detectedColumns: (this.headerDetection?.columns ?? [])
         .filter((c) => c.type !== 'unknown')
         .map((c) => c.type),
       columnDetails: this.headerDetection?.columns ?? [],
+      fallbackTriggered: this.fallbackTriggered || undefined,
+      fallbackReason: this.fallbackReason,
+      itemsBeforeFallback: this.itemsBeforeFallback,
       ocrUsed: this.ocrUsedPages.length > 0,
       ocrUsedPages: this.ocrUsedPages,
       ocrMethod: this.ocrMethod,
@@ -202,6 +282,13 @@ export class ParseLogBuilder {
       warnings: this.warnings,
       errors: this.errors,
       mergedContinuationLines: this.mergedContinuationLines,
+      continuationStats: this.continuationStats,
+      zoneDetection: this.zoneDetection,
+      headerReappearance: this.headerReappearance,
+      qtyLookahead: this.qtyLookahead,
+      specLinesStats: this.specLinesStats,
+      confidenceStats: this.confidenceStats,
+      postProcessingStats: this.postProcessingStats,
       extractionPath: this.extractionPath,
       layoutStats: this.layoutStats,
       unknownBrandCandidates: this.unknownBrandCandidates.length > 0 ? this.unknownBrandCandidates : undefined,
@@ -298,6 +385,19 @@ export class ParseLogService {
       );
     }
 
+    if (log.headerRejectionReason) {
+      lines.push(`  Rejection Reason: ${log.headerRejectionReason}`);
+    }
+
+    if (log.fallbackTriggered) {
+      lines.push(
+        ``,
+        `Fallback Triggered: Yes`,
+        `  Reason: ${log.fallbackReason}`,
+        `  Items Before Fallback: ${log.itemsBeforeFallback}`
+      );
+    }
+
     lines.push(
       ``,
       `OCR Used: ${log.ocrUsed ? `Yes (pages: ${log.ocrUsedPages.join(', ')})` : 'No'}`,
@@ -323,6 +423,44 @@ export class ParseLogService {
 
     if (log.mergedContinuationLines && log.mergedContinuationLines > 0) {
       lines.push(`Merged Continuation Lines: ${log.mergedContinuationLines}`);
+    }
+
+    if (log.continuationStats) {
+      lines.push(
+        `Continuation Stats:`,
+        `  Items with Continuations: ${log.continuationStats.itemsWithContinuations}`,
+        `  Max Continuations per Item: ${log.continuationStats.maxContinuationsPerItem}`,
+        `  Items with Single-Line Qty: ${log.continuationStats.itemsWithSingleLineQty}`
+      );
+    }
+
+    if (log.zoneDetection) {
+      lines.push(
+        ``,
+        `Zone Detection: ${log.zoneDetection.detectionMethod}`,
+        `  Start Line: ${log.zoneDetection.itemsZoneStartLine}`,
+        `  End Line: ${log.zoneDetection.itemsZoneEndLine}`,
+        `  Zone Lines: ${log.zoneDetection.zoneLineCount}`
+      );
+    }
+
+    if (log.confidenceStats) {
+      lines.push(
+        ``,
+        `Confidence Stats:`,
+        `  Min/Max/Avg: ${log.confidenceStats.minConfidence}/${log.confidenceStats.maxConfidence}/${log.confidenceStats.avgConfidence}`,
+        `  Low Confidence Items: ${log.confidenceStats.lowConfidenceItemCount}`,
+        `  Needs Verification: ${log.confidenceStats.needsVerification ? 'Yes' : 'No'}`
+      );
+    }
+
+    if (log.postProcessingStats && (log.postProcessingStats.itemsMerged > 0 || log.postProcessingStats.emptyItemsRemoved > 0)) {
+      lines.push(
+        ``,
+        `Post-Processing:`,
+        `  Items Merged: ${log.postProcessingStats.itemsMerged}`,
+        `  Empty Items Removed: ${log.postProcessingStats.emptyItemsRemoved}`
+      );
     }
 
     if (log.extractionPath) {

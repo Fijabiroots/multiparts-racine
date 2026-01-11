@@ -165,10 +165,17 @@ export interface ParseLog {
   headerScore: number;
   headerPage?: number;
   headerLineIndex?: number;
+  headerRejectionReason?: string;   // Raison si le header a été rejeté
+  headerIsFormMetadata?: boolean;   // True si le header détecté était une métadonnée de formulaire
 
   // Colonnes détectées
   detectedColumns: ColumnType[];
   columnDetails: DetectedColumn[];
+
+  // Fallback parsing
+  fallbackTriggered?: boolean;      // True si fallback a été utilisé après échec header-based
+  fallbackReason?: string;          // Raison du fallback
+  itemsBeforeFallback?: number;     // Nombre d'items avant fallback
 
   // OCR
   ocrUsed: boolean;
@@ -186,6 +193,54 @@ export interface ParseLog {
 
   // Multiline merging
   mergedContinuationLines?: number;
+
+  // Continuation stats per item
+  continuationStats?: {
+    itemsWithContinuations: number;    // Nombre d'items avec lignes de continuation
+    maxContinuationsPerItem: number;   // Max de lignes de continuation sur un seul item
+    itemsWithSingleLineQty: number;    // Items où la quantité était sur une ligne isolée
+  };
+
+  // Zone segmentation stats
+  zoneDetection?: {
+    itemsZoneStartLine?: number;       // Ligne de début de zone items
+    itemsZoneEndLine?: number;         // Ligne de fin de zone items
+    detectionMethod: 'header-based' | 'keyword-based' | 'heuristic' | 'full-document';
+    zoneLineCount: number;             // Nombre de lignes dans la zone items
+  };
+
+  // Header reappearance tracking
+  headerReappearance?: {
+    repeatedHeadersIgnored: number;    // Nombre de headers répétés ignorés
+    repeatedHeaderLines: number[];     // Indices des lignes de headers répétés
+  };
+
+  // Qty lookahead/lookbehind stats
+  qtyLookahead?: {
+    qtyRecoveredViaLookahead: number;  // Qty trouvées sur ligne suivante
+    qtyRecoveredViaLookbehind: number; // Qty trouvées sur ligne précédente
+  };
+
+  // Spec lines stats
+  specLinesStats?: {
+    specLinesAttached: number;         // Lignes spec rattachées à l'item précédent
+    specLinePatterns: string[];        // Types de patterns détectés (IP, norm, key:value)
+  };
+
+  // Confidence scoring stats
+  confidenceStats?: {
+    minConfidence: number;
+    maxConfidence: number;
+    avgConfidence: number;
+    lowConfidenceItemCount: number;    // Items avec score < 50
+    needsVerification: boolean;        // True si trop d'items faibles
+  };
+
+  // Post-processing stats
+  postProcessingStats?: {
+    itemsMerged: number;               // Items fusionnés
+    emptyItemsRemoved: number;         // Items vides supprimés/rattachés
+  };
 
   // Extraction path: which method was used
   extractionPath?: 'pdfjs_layout' | 'pdf-parse' | 'ocr' | 'mixed';
