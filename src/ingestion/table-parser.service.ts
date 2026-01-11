@@ -1089,7 +1089,28 @@ export class TableParserService implements OnModuleInit {
   }
 
   /**
-   * Extrait la marque depuis la description
+   * Unknown brand candidates detected during parsing (for logging)
+   */
+  private unknownBrandCandidates: Map<string, number> = new Map();
+
+  /**
+   * Get detected unknown brand candidates
+   */
+  getUnknownBrandCandidates(): Array<{ brand: string; count: number }> {
+    return Array.from(this.unknownBrandCandidates.entries())
+      .map(([brand, count]) => ({ brand, count }))
+      .sort((a, b) => b.count - a.count);
+  }
+
+  /**
+   * Clear unknown brand candidates
+   */
+  clearUnknownBrandCandidates(): void {
+    this.unknownBrandCandidates.clear();
+  }
+
+  /**
+   * Extrait la marque depuis la description avec fuzzy matching
    */
   private extractBrand(description: string): string | undefined {
     const upper = description.toUpperCase();
@@ -1100,6 +1121,7 @@ export class TableParserService implements OnModuleInit {
 
     const sortedBrands = [...this.knownBrands].sort((a, b) => b.length - a.length);
 
+    // Exact match first
     for (const brand of sortedBrands) {
       const regex = new RegExp(`\\b${brand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
       if (regex.test(upper)) {
@@ -1107,6 +1129,126 @@ export class TableParserService implements OnModuleInit {
         return brand;
       }
     }
+
+    // Fuzzy match for longer brands (>= 5 chars)
+    const words = upper.split(/[\s\-_\/]+/).filter(w => w.length >= 4);
+    for (const word of words) {
+      for (const brand of sortedBrands) {
+        if (brand.length >= 5) {
+          const similarity = this.calculateSimilarity(word, brand);
+          if (similarity >= 0.85) {
+            this.logger.debug(`Fuzzy brand match: "${word}" -> "${brand}" (${(similarity * 100).toFixed(0)}%)`);
+            return brand;
+          }
+        }
+      }
+    }
+
+    // Detect potential unknown brands (capitalized words, common brand patterns)
+    this.detectUnknownBrandCandidate(description);
+
+    return undefined;
+  }
+
+  /**
+   * Detect potential unknown brand candidates from description
+   */
+  private detectUnknownBrandCandidate(description: string): void {
+    // Look for potential brand patterns:
+    // - All caps words (4+ chars)
+    // - Words with specific patterns (ends with -CO, -INC, -CORP, -LTD)
+    const patterns = [
+      /\b([A-Z]{4,15})\b/g,  // All caps word
+      /\b([A-Z][A-Za-z]{3,}(?:CO|INC|CORP|LTD|SA|AG|SRL))\b/gi,  // Company suffix
+    ];
+
+    const candidates = new Set<string>();
+
+    for (const pattern of patterns) {
+      let match;
+      while ((match = pattern.exec(description)) !== null) {
+        const candidate = match[1].toUpperCase();
+        // Filter out common non-brand words
+        const exclusions = [
+          'RELAY', 'VALVE', 'PUMP', 'MOTOR', 'SEAL', 'BEARING', 'FILTER',
+          'SHAFT', 'GEAR', 'COVER', 'PLATE', 'BOLT', 'SCREW', 'WIRE',
+          'CABLE', 'HOSE', 'TUBE', 'PIPE', 'RING', 'BUSH', 'DISC',
+          'THERMAL', 'OVERLOAD', 'HYDRAULIC', 'PNEUMATIC', 'ELECTRIC',
+          'STEEL', 'RUBBER', 'PLASTIC', 'BRASS', 'COPPER', 'IRON',
+          'EACH', 'UNIT', 'PIECE', 'PACK', 'SET', 'KIT', 'ASSY',
+        ];
+
+        if (!exclusions.includes(candidate) && !this.knownBrands.includes(candidate)) {
+          candidates.add(candidate);
+        }
+      }
+    }
+
+    // Track candidates
+    for (const candidate of candidates) {
+      const count = this.unknownBrandCandidates.get(candidate) || 0;
+      this.unknownBrandCandidates.set(candidate, count + 1);
+    }
+  }
+
+  /**
+   * Calculate string similarity (Jaro-Winkler inspired)
+   */
+  private calculateSimilarity(s1: string, s2: string): number {
+    if (s1 === s2) return 1;
+    if (s1.length === 0 || s2.length === 0) return 0;
+
+    const longer = s1.length > s2.length ? s1 : s2;
+    const shorter = s1.length > s2.length ? s2 : s1;
+
+    // Simple character overlap ratio
+    let matches = 0;
+    for (let i = 0; i < shorter.length; i++) {
+      if (longer.includes(shorter[i])) {
+        matches++;
+      }
+    }
+
+    const charOverlap = matches / longer.length;
+
+    // Common prefix bonus
+    let prefixLength = 0;
+    for (let i = 0; i < Math.min(4, shorter.length); i++) {
+      if (s1[i] === s2[i]) {
+        prefixLength++;
+      } else {
+        break;
+      }
+    }
+
+    const prefixBonus = prefixLength * 0.05;
+
+    // Substring bonus
+    const substringBonus = longer.includes(shorter) || shorter.includes(longer) ? 0.2 : 0;
+
+    return Math.min(1, charOverlap + prefixBonus + substringBonus);
+  }
+
+  /**
+   * Extract brand from filename
+   */
+  extractBrandFromFilename(filename: string): string | undefined {
+    const upper = filename.toUpperCase();
+
+    if (this.knownBrands.length === 0) {
+      this.knownBrands = FALLBACK_BRANDS;
+    }
+
+    // Sort by length (longest first) to match most specific brands
+    const sortedBrands = [...this.knownBrands].sort((a, b) => b.length - a.length);
+
+    for (const brand of sortedBrands) {
+      if (upper.includes(brand)) {
+        if (brand === 'CAT') return 'CATERPILLAR';
+        return brand;
+      }
+    }
+
     return undefined;
   }
 
