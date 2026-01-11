@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { DatabaseService } from '../database/database.service';
 import { ParsedEmail } from '../common/interfaces';
 import { DetectionKeyword } from '../database/entities';
@@ -13,13 +13,18 @@ export interface DetectionResult {
 }
 
 @Injectable()
-export class DetectorService {
+export class DetectorService implements OnModuleInit {
   private readonly logger = new Logger(DetectorService.name);
   private keywords: DetectionKeyword[] = [];
-  private readonly CONFIDENCE_THRESHOLD = 30; // Seuil minimum pour considérer comme demande de prix
+  private readonly CONFIDENCE_THRESHOLD = 40; // Seuil minimum pour considérer comme demande de prix
+  private readonly SCORE_FOR_100_PERCENT = 30; // Score nécessaire pour atteindre 100% de confiance
 
   constructor(private readonly databaseService: DatabaseService) {
-    this.loadKeywords();
+    // Keywords loaded in onModuleInit after database is ready
+  }
+
+  async onModuleInit() {
+    await this.loadKeywords();
   }
 
   private async loadKeywords() {
@@ -63,6 +68,27 @@ export class DetectorService {
       };
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // FAST-PATH: Patterns explicites de demandes de prix (détection immédiate)
+    // ═══════════════════════════════════════════════════════════════════════
+    const explicitRfqCheck = this.checkExplicitRfqPatterns(subjectLower, bodyLower);
+    if (explicitRfqCheck.isExplicitRfq) {
+      // Vérifier les pièces jointes
+      const relevantExtensions = ['.pdf', '.xlsx', '.xls', '.docx', '.doc'];
+      const attachmentTypes = email.attachments
+        .map(att => att.filename.substring(att.filename.lastIndexOf('.')).toLowerCase())
+        .filter(ext => relevantExtensions.includes(ext));
+
+      return {
+        isPriceRequest: true,
+        confidence: 95,
+        matchedKeywords: [{ keyword: explicitRfqCheck.pattern!, location: 'subject', weight: 10 }],
+        hasRelevantAttachments: attachmentTypes.length > 0,
+        attachmentTypes,
+        reason: `Demande de prix explicite détectée: ${explicitRfqCheck.pattern}`,
+      };
+    }
+
     // Analyser chaque mot-clé
     for (const kw of this.keywords) {
       const keywordLower = kw.keyword.toLowerCase();
@@ -96,9 +122,14 @@ export class DetectorService {
       totalScore += 10;
     }
 
-    // Calculer la confiance (0-100)
-    const maxPossibleScore = this.keywords.reduce((sum, kw) => sum + kw.weight * 2.5, 0) + 10;
-    const confidence = Math.min(100, Math.round((totalScore / maxPossibleScore) * 100 * 2));
+    // Calculer la confiance (0-100) avec un seuil fixe
+    // Ainsi, le score ne dépend pas du nombre de mots-clés dans la base
+    // Exemples de scores typiques:
+    // - "RFQ" dans le corps = 10 points → 33%
+    // - "RFQ" dans le sujet = 15 points → 50%
+    // - "demande de prix" + "devis" dans le corps = 18 points → 60%
+    // - "RFQ" sujet + "quotation" corps + pièce jointe = 15 + 8 + 10 = 33 points → 100%
+    const confidence = Math.min(100, Math.round((totalScore / this.SCORE_FOR_100_PERCENT) * 100));
 
     const isPriceRequest = confidence >= this.CONFIDENCE_THRESHOLD;
 
@@ -158,6 +189,61 @@ export class DetectorService {
       { id: '8', keyword: 'price request', weight: 9, language: 'en', type: 'both' },
       { id: '9', keyword: 'quote request', weight: 8, language: 'en', type: 'both' },
     ];
+  }
+
+  /**
+   * Vérifie si l'email contient des patterns explicites de demande de prix
+   * (détection rapide sans calcul de score)
+   */
+  private checkExplicitRfqPatterns(subject: string, body: string): { isExplicitRfq: boolean; pattern?: string } {
+    // Patterns explicites dans le sujet qui indiquent clairement une RFQ
+    const explicitPatterns = [
+      // "RFQ" seul dans le sujet - terme très spécifique aux demandes de prix
+      { pattern: /\brfq\b/i, label: 'RFQ' },
+
+      // "RFQ FOR ..." - Pattern très courant
+      { pattern: /\brfq\s+for\b/i, label: 'RFQ FOR' },
+      { pattern: /\brfq\s+pr[-\s]?\d+/i, label: 'RFQ PR-xxx' },
+      { pattern: /\brfq\s+#?\d+/i, label: 'RFQ #xxx' },
+
+      // "Request for Quotation" explicite
+      { pattern: /\brequest\s+for\s+quotation\b/i, label: 'Request for Quotation' },
+      { pattern: /\brequest\s+for\s+quote\b/i, label: 'Request for Quote' },
+
+      // Français explicite
+      { pattern: /\bdemande\s+de\s+prix\b/i, label: 'Demande de prix' },
+      { pattern: /\bdemande\s+de\s+cotation\b/i, label: 'Demande de cotation' },
+      { pattern: /\bdemande\s+de\s+devis\b/i, label: 'Demande de devis' },
+      { pattern: /\bappel\s+d['']?offres?\b/i, label: 'Appel d\'offres' },
+
+      // Patterns avec numéro de référence
+      { pattern: /\brfq\s*[-:]\s*[a-z0-9]{3,}/i, label: 'RFQ-xxx' },
+      { pattern: /\bquotation\s+request\s+(?:for|#|n[°o])/i, label: 'Quotation Request' },
+      { pattern: /\bprice\s+request\s+(?:for|#|n[°o])/i, label: 'Price Request' },
+    ];
+
+    // Vérifier d'abord le sujet (plus fiable)
+    for (const { pattern, label } of explicitPatterns) {
+      if (pattern.test(subject)) {
+        return { isExplicitRfq: true, pattern: label };
+      }
+    }
+
+    // Vérifier le corps pour les patterns les plus explicites
+    const bodyPatterns = [
+      { pattern: /\bplease\s+(?:quote|provide\s+(?:your\s+)?(?:best\s+)?(?:price|quotation))\b/i, label: 'Please quote' },
+      { pattern: /\bkindly\s+(?:quote|send\s+(?:your\s+)?(?:best\s+)?(?:price|quotation))\b/i, label: 'Kindly quote' },
+      { pattern: /\bmerci\s+de\s+(?:nous\s+)?(?:coter|chiffrer|transmettre\s+(?:votre\s+)?(?:meilleur[es]?\s+)?prix)\b/i, label: 'Merci de coter' },
+      { pattern: /\bprière\s+de\s+(?:nous\s+)?faire\s+parvenir\s+(?:votre\s+)?(?:meilleur[es]?\s+)?(?:offre|prix)\b/i, label: 'Prière de faire parvenir' },
+    ];
+
+    for (const { pattern, label } of bodyPatterns) {
+      if (pattern.test(body)) {
+        return { isExplicitRfq: true, pattern: label };
+      }
+    }
+
+    return { isExplicitRfq: false };
   }
 
   /**
