@@ -42,16 +42,21 @@
     "class-validator": "^0.14.3",
     "cron": "^4.4.0",
     "exceljs": "^4.4.0",
+    "fast-glob": "^3.3.3",
     "imap-simple": "^5.1.0",
     "mailparser": "^3.9.1",
     "mammoth": "^1.11.0",
     "nodemailer": "^7.0.12",
     "pdf-parse": "^1.1.1",
+    "pdfjs-dist": "^5.4.530",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2",
+    "sharp": "^0.34.5",
     "sql.js": "^1.13.0",
+    "tesseract.js": "^7.0.0",
     "uuid": "^13.0.0",
-    "xlsx": "^0.18.5"
+    "xlsx": "^0.18.5",
+    "zod": "^4.3.5"
   },
   "devDependencies": {
     "@nestjs/cli": "^11.0.14",
