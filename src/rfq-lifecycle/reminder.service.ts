@@ -92,10 +92,10 @@ Email: <a href="mailto:${c.primaryEmail}">${c.primaryEmail}</a>
    */
   async processReminders(): Promise<ReminderResult[]> {
     const results: ReminderResult[] = [];
-    
+
     const maxReminders = this.configService.get<number>('reminder.maxReminders', 3);
     const daysBetween = this.configService.get<number>('reminder.daysBetweenReminders', 2);
-    
+
     // Obtenir les fournisseurs à relancer
     const suppliersToRemind = this.rfqLifecycleService.getSuppliersNeedingReminder(
       maxReminders,
@@ -103,6 +103,9 @@ Email: <a href="mailto:${c.primaryEmail}">${c.primaryEmail}</a>
     );
 
     this.logger.log(`${suppliersToRemind.length} fournisseur(s) à relancer`);
+
+    // Tracker les RFQs pour lesquels on a envoyé des relances (pour suivi client)
+    const rfqsWithReminders = new Set<string>();
 
     for (const supplier of suppliersToRemind) {
       try {
@@ -112,26 +115,31 @@ Email: <a href="mailto:${c.primaryEmail}">${c.primaryEmail}</a>
 
         // Envoyer la relance
         const success = await this.sendReminder(supplier, rfq);
-        
+
         if (success) {
           // Mettre à jour le statut
           this.rfqLifecycleService.markSupplierReminded(supplier.rfqNumber, supplier.email);
-          
+          rfqsWithReminders.add(supplier.rfqNumber);
+
           // Émettre webhook: Relance envoyée
           await this.webhookService.emitReminderSent(
             supplier.rfqNumber,
             supplier.email,
             supplier.reminderCount + 1
           );
-          
-          // Vérifier si max atteint
+
+          // Vérifier si max atteint - marquer comme 'sans_réponse'
           if (supplier.reminderCount + 1 >= maxReminders) {
+            this.rfqLifecycleService.markSupplierNoResponse(supplier.rfqNumber, supplier.email);
+
             await this.webhookService.emit(WebhookEventType.REMINDER_MAX_REACHED, {
               rfqNumber: supplier.rfqNumber,
               supplierEmail: supplier.email,
               reminderCount: supplier.reminderCount + 1,
               maxReminders,
             }, { rfqNumber: supplier.rfqNumber, supplierEmail: supplier.email });
+
+            this.logger.log(`⛔ Max relances atteint pour ${supplier.email} (${supplier.rfqNumber}) - arrêt des relances`);
           }
         } else {
           // Émettre webhook: Échec relance
@@ -169,7 +177,183 @@ Email: <a href="mailto:${c.primaryEmail}">${c.primaryEmail}</a>
       this.logger.log(`✅ Relances: ${successCount}/${results.length} envoyées`);
     }
 
+    // Envoyer les emails de suivi aux clients si nécessaire
+    await this.processClientReassurances(rfqsWithReminders);
+
     return results;
+  }
+
+  /**
+   * Envoyer les emails de suivi aux clients pour les RFQs avec relances
+   */
+  private async processClientReassurances(rfqsWithReminders: Set<string>): Promise<void> {
+    for (const rfqNumber of rfqsWithReminders) {
+      try {
+        if (this.rfqLifecycleService.needsClientReassurance(rfqNumber)) {
+          const rfq = this.rfqLifecycleService.getRfqByNumber(rfqNumber);
+          if (rfq && rfq.clientEmail) {
+            await this.sendClientReassurance(rfq);
+          }
+        }
+      } catch (error) {
+        this.logger.error(`Erreur envoi suivi client ${rfqNumber}: ${error.message}`);
+      }
+    }
+  }
+
+  /**
+   * Envoyer un email de suivi/réassurance au client
+   */
+  async sendClientReassurance(rfq: SentRfq): Promise<boolean> {
+    if (!rfq.clientEmail) {
+      this.logger.warn(`Pas d'email client pour ${rfq.internalRfqNumber}`);
+      return false;
+    }
+
+    try {
+      const { subject, htmlBody, textBody } = this.generateClientReassuranceContent(rfq);
+
+      const mailOptions: nodemailer.SendMailOptions = {
+        from: this.configService.get<string>('smtp.from', 'procurement@multipartsci.com'),
+        to: rfq.clientEmail,
+        subject,
+        text: textBody,
+        html: htmlBody,
+        replyTo: this.configService.get<string>('smtp.replyTo', 'procurement@multipartsci.com'),
+      };
+
+      await this.transporter.sendMail(mailOptions);
+
+      // Marquer comme envoyé
+      this.rfqLifecycleService.markClientReassuranceSent(rfq.internalRfqNumber);
+
+      this.logger.log(`📧 Email de suivi envoyé au client ${rfq.clientEmail} pour ${rfq.internalRfqNumber}`);
+      return true;
+
+    } catch (error) {
+      this.logger.error(`Erreur envoi suivi client: ${error.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Générer le contenu de l'email de suivi client
+   */
+  private generateClientReassuranceContent(rfq: SentRfq): { subject: string; htmlBody: string; textBody: string } {
+    const subject = `Suivi de votre demande - ${rfq.internalRfqNumber}${rfq.clientRfqNumber ? ` (Réf: ${rfq.clientRfqNumber})` : ''}`;
+
+    // Compter les statuts des fournisseurs
+    const totalSuppliers = rfq.suppliers.length;
+    const quotesReceived = rfq.suppliers.filter(s => s.status === 'offre_reçue').length;
+    const declined = rfq.suppliers.filter(s => s.status === 'refus').length;
+    const pending = rfq.suppliers.filter(s => ['consulté', 'relancé'].includes(s.status)).length;
+    const noResponse = rfq.suppliers.filter(s => s.status === 'sans_réponse').length;
+
+    const receivedDate = rfq.clientReceivedAt
+      ? new Date(rfq.clientReceivedAt).toLocaleDateString('fr-FR')
+      : new Date(rfq.sentAt).toLocaleDateString('fr-FR');
+
+    const htmlBody = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body { font-family: Arial, sans-serif; font-size: 14px; color: #333; line-height: 1.6; }
+    .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+    .header { border-bottom: 2px solid #1a5276; padding-bottom: 10px; margin-bottom: 20px; }
+    .info-box { background: #e8f6f3; padding: 15px; border-left: 4px solid #1abc9c; margin: 15px 0; }
+    .status-table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+    .status-table td, .status-table th { padding: 8px; border-bottom: 1px solid #ddd; }
+    .status-table th { text-align: left; background: #f8f9fa; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h2 style="color: #1a5276; margin: 0;">📋 Suivi de votre demande de prix</h2>
+    </div>
+
+    <p>Bonjour${rfq.clientName ? ` ${rfq.clientName}` : ''},</p>
+
+    <p>Nous vous informons que votre demande de prix est en cours de traitement.</p>
+
+    <div class="info-box">
+      <strong>📋 Référence de la demande:</strong><br>
+      • N° Interne: ${rfq.internalRfqNumber}<br>
+      ${rfq.clientRfqNumber ? `• Votre référence: ${rfq.clientRfqNumber}<br>` : ''}
+      • Reçue le: ${receivedDate}<br>
+      ${rfq.itemCount ? `• Nombre d'articles: ${rfq.itemCount}<br>` : ''}
+    </div>
+
+    <p><strong>État d'avancement des consultations:</strong></p>
+
+    <table class="status-table">
+      <tr>
+        <th>Statut</th>
+        <th>Nombre</th>
+      </tr>
+      <tr>
+        <td>✅ Offres reçues</td>
+        <td>${quotesReceived}</td>
+      </tr>
+      <tr>
+        <td>⏳ En attente de réponse</td>
+        <td>${pending}</td>
+      </tr>
+      ${declined > 0 ? `<tr><td>❌ Déclinées</td><td>${declined}</td></tr>` : ''}
+      ${noResponse > 0 ? `<tr><td>⚠️ Sans réponse (relances max)</td><td>${noResponse}</td></tr>` : ''}
+      <tr style="font-weight: bold;">
+        <td>Total fournisseurs consultés</td>
+        <td>${totalSuppliers}</td>
+      </tr>
+    </table>
+
+    <p>Nous continuons à suivre activement cette demande et vous tiendrons informé(e) de l'évolution.</p>
+
+    <p>Pour toute question, n'hésitez pas à nous contacter.</p>
+
+    <p>Cordialement,</p>
+
+    ${this.signature}
+  </div>
+</body>
+</html>`;
+
+    const textBody = `
+SUIVI DE VOTRE DEMANDE DE PRIX
+==============================
+
+Bonjour${rfq.clientName ? ` ${rfq.clientName}` : ''},
+
+Nous vous informons que votre demande de prix est en cours de traitement.
+
+RÉFÉRENCE DE LA DEMANDE:
+- N° Interne: ${rfq.internalRfqNumber}
+${rfq.clientRfqNumber ? `- Votre référence: ${rfq.clientRfqNumber}` : ''}
+- Reçue le: ${receivedDate}
+${rfq.itemCount ? `- Nombre d'articles: ${rfq.itemCount}` : ''}
+
+ÉTAT D'AVANCEMENT DES CONSULTATIONS:
+- Offres reçues: ${quotesReceived}
+- En attente de réponse: ${pending}
+${declined > 0 ? `- Déclinées: ${declined}` : ''}
+${noResponse > 0 ? `- Sans réponse (relances max): ${noResponse}` : ''}
+- Total fournisseurs consultés: ${totalSuppliers}
+
+Nous continuons à suivre activement cette demande et vous tiendrons informé(e) de l'évolution.
+
+Pour toute question, n'hésitez pas à nous contacter.
+
+Cordialement,
+
+--
+Service Approvisionnement
+MULTIPARTS CI
+procurement@multipartsci.com
+`;
+
+    return { subject, htmlBody, textBody };
   }
 
   /**

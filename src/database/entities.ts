@@ -18,13 +18,15 @@ export interface RfqMapping {
   clientId?: string;
   clientRfqNumber?: string; // Numéro RFQ du client
   internalRfqNumber: string; // Notre numéro de demande
-  emailId?: string; // ID de l'email source
+  emailId?: string; // ID de l'email source (UID IMAP)
+  messageId?: string; // Message-ID header (pour déduplication cross-mailbox)
   emailSubject?: string;
   receivedAt?: Date;
   processedAt: Date;
   status: 'pending' | 'processed' | 'draft_pending' | 'sent' | 'completed' | 'error';
   excelPath?: string;
   notes?: string;
+  mailbox?: string; // Adresse email qui a reçu le message
 }
 
 // Configuration de traitement

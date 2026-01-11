@@ -3,18 +3,45 @@ import { DatabaseService } from '../database/database.service';
 import { EmailService } from '../email/email.service';
 import { DetectorService } from '../detector/detector.service';
 import { DocumentParserService } from '../parser/document-parser.service';
+import { AttachmentClassifierService, ClassifiedAttachment, AttachmentCategory } from '../parser/attachment-classifier.service';
 import { ExcelService } from '../excel/excel.service';
 import { DraftService } from '../draft/draft.service';
 import { TrackingService } from '../tracking/tracking.service';
 import { UnifiedIngestionService } from '../ingestion/unified-ingestion.service';
 import { ParseLogService } from '../ingestion/parse-log.service';
-import { ParsedEmail, PriceRequest, PriceRequestItem } from '../common/interfaces';
+import { ParsedEmail, PriceRequest, PriceRequestItem, ClientRequirements, EmailAttachment } from '../common/interfaces';
 import { Client } from '../database/entities';
+import {
+  extractClientRequirements,
+  calculateDeadlineWithBusinessHours,
+  hasImportantRequirements,
+} from '../common/client-requirements';
 
 interface ProcessOptions {
   endDate?: Date;
   folders: string[];
   autoSendDraft: boolean;
+}
+
+/**
+ * Résultat du traitement d'une seule demande extraite d'un email
+ */
+interface SingleRequestResult {
+  internalRfqNumber: string;
+  clientRfqNumber?: string;
+  excelPath: string;
+  brand?: string;
+  itemCount: number;
+  technicalSheets: string[]; // Noms des fiches techniques associées
+}
+
+/**
+ * Groupe de pièces jointes à traiter ensemble
+ */
+interface AttachmentGroup {
+  rfqAttachments: ClassifiedAttachment[];
+  technicalSheets: ClassifiedAttachment[];
+  brand?: string;
 }
 
 export interface ProcessResult {
@@ -39,11 +66,15 @@ export class AutoProcessorService {
   // Flag to use the new unified ingestion pipeline (set to true to enable)
   private readonly useUnifiedIngestion = true;
 
+  // Adresse email courante du mailbox en cours de traitement
+  private currentMailbox: string = 'procurement@multipartsci.com';
+
   constructor(
     private readonly databaseService: DatabaseService,
     private readonly emailService: EmailService,
     private readonly detectorService: DetectorService,
     private readonly documentParser: DocumentParserService,
+    private readonly attachmentClassifier: AttachmentClassifierService,
     private readonly excelService: ExcelService,
     private readonly draftService: DraftService,
     private readonly trackingService: TrackingService,
@@ -84,15 +115,21 @@ export class AutoProcessorService {
             continue;
           }
 
-          // Vérifier si déjà traité
-          const isProcessed = await this.databaseService.isEmailProcessed(email.id);
-          if (isProcessed) {
+          // Vérifier si déjà traité (par UID IMAP ou Message-ID pour cross-mailbox)
+          const isProcessedByUid = await this.databaseService.isEmailProcessed(email.id);
+          const isProcessedByMessageId = email.messageId
+            ? await this.databaseService.isMessageIdProcessed(email.messageId)
+            : false;
+
+          if (isProcessedByUid || isProcessedByMessageId) {
             result.skipped++;
             result.details.push({
               emailId: email.id,
               subject: email.subject,
               status: 'skipped',
-              error: 'Déjà traité',
+              error: isProcessedByMessageId
+                ? 'Déjà traité (même email reçu sur autre boîte)'
+                : 'Déjà traité',
             });
             continue;
           }
@@ -184,6 +221,370 @@ export class AutoProcessorService {
     clientRfqNumber?: string;
     excelPath: string;
   }> {
+    // ═══════════════════════════════════════════════════════════════════════
+    // NOUVEAU: Traitement multi-demandes
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // 1. Classifier toutes les pièces jointes
+    const classifiedAttachments = this.attachmentClassifier.classifyAttachments(email.attachments);
+
+    // Séparer RFQs, fiches techniques et images
+    const rfqAttachments = classifiedAttachments.filter(c => c.category === 'rfq');
+    const technicalSheets = classifiedAttachments.filter(c => c.category === 'technical_sheet');
+    const images = classifiedAttachments.filter(c => c.category === 'image' && c.confidence < 100);
+
+    this.logger.debug(
+      `Attachments classifiés: ${rfqAttachments.length} RFQ, ${technicalSheets.length} fiches techniques, ${images.length} images`
+    );
+
+    // 2. Grouper les RFQs
+    const groups = this.groupRfqAttachments(rfqAttachments, technicalSheets);
+
+    this.logger.debug(`${groups.length} groupe(s) de demandes à traiter`);
+
+    // 3. Traiter chaque groupe
+    const results: SingleRequestResult[] = [];
+
+    for (const group of groups) {
+      try {
+        const result = await this.processAttachmentGroup(email, group, autoSendDraft, images);
+        results.push(result);
+      } catch (error) {
+        this.logger.error(`Erreur traitement groupe ${group.brand || 'unknown'}: ${error.message}`);
+      }
+    }
+
+    // 4. Si aucun résultat, traiter l'email de manière classique (fallback)
+    if (results.length === 0) {
+      return this.processEmailClassic(email, autoSendDraft);
+    }
+
+    // Retourner le premier résultat (pour compatibilité avec l'interface existante)
+    // Les autres résultats ont déjà été sauvegardés
+    const firstResult = results[0];
+
+    if (results.length > 1) {
+      this.logger.log(
+        `Email traité en ${results.length} demandes distinctes: ${results.map(r => r.internalRfqNumber).join(', ')}`
+      );
+    }
+
+    return {
+      internalRfqNumber: firstResult.internalRfqNumber,
+      clientRfqNumber: firstResult.clientRfqNumber,
+      excelPath: firstResult.excelPath,
+    };
+  }
+
+  /**
+   * Grouper les attachements RFQ par marque ou individuellement
+   */
+  private groupRfqAttachments(
+    rfqAttachments: ClassifiedAttachment[],
+    technicalSheets: ClassifiedAttachment[],
+  ): AttachmentGroup[] {
+    // Si aucun RFQ, retourner un groupe vide (sera traité par fallback)
+    if (rfqAttachments.length === 0) {
+      return [];
+    }
+
+    // Si un seul RFQ, créer un groupe unique
+    if (rfqAttachments.length === 1) {
+      return [{
+        rfqAttachments,
+        technicalSheets: technicalSheets.filter(ts => !ts.relatedTo || ts.relatedTo === rfqAttachments[0].attachment.filename),
+        brand: rfqAttachments[0].brand,
+      }];
+    }
+
+    // Si tous les RFQs ont la même marque, les grouper ensemble
+    if (this.attachmentClassifier.allSameBrand(rfqAttachments)) {
+      const brand = rfqAttachments[0].brand;
+      this.logger.debug(`Tous les RFQs ont la même marque (${brand}), regroupement`);
+      return [{
+        rfqAttachments,
+        technicalSheets,
+        brand,
+      }];
+    }
+
+    // Sinon, créer un groupe par RFQ
+    const groups: AttachmentGroup[] = [];
+
+    for (const rfq of rfqAttachments) {
+      // Trouver les fiches techniques associées à ce RFQ
+      const matchingSheets = technicalSheets.filter(ts =>
+        ts.relatedTo === rfq.attachment.filename ||
+        ts.brand === rfq.brand
+      );
+
+      groups.push({
+        rfqAttachments: [rfq],
+        technicalSheets: matchingSheets,
+        brand: rfq.brand,
+      });
+    }
+
+    return groups;
+  }
+
+  /**
+   * Traiter un groupe de pièces jointes comme une demande unique
+   */
+  private async processAttachmentGroup(
+    email: ParsedEmail,
+    group: AttachmentGroup,
+    autoSendDraft: boolean,
+    images: ClassifiedAttachment[],
+  ): Promise<SingleRequestResult> {
+    // 1. Identifier ou créer le client
+    const client = await this.findOrCreateClient(email);
+
+    // 2. Générer le numéro RFQ interne
+    const internalRfqNumber = this.excelService.generateRequestNumber();
+
+    let allItems: PriceRequestItem[] = [];
+    let clientRfqNumber: string | undefined;
+    let needsManualReview = false;
+
+    // 3. Parser uniquement les pièces jointes de ce groupe
+    const groupAttachments = group.rfqAttachments.map(c => c.attachment);
+
+    // Use unified ingestion pipeline if available and enabled
+    if (this.useUnifiedIngestion && this.unifiedIngestion) {
+      this.logger.debug(`Using unified ingestion for group: ${group.brand || 'unknown'}`);
+
+      // Créer un email virtuel avec uniquement les pièces jointes du groupe
+      const virtualEmail: ParsedEmail = {
+        ...email,
+        attachments: groupAttachments,
+      };
+
+      const ingestionResult = await this.unifiedIngestion.processEmail(
+        virtualEmail,
+        internalRfqNumber
+      );
+
+      allItems = ingestionResult.items;
+      clientRfqNumber = ingestionResult.rfqNumber || group.rfqAttachments[0]?.rfqNumber;
+      needsManualReview = ingestionResult.needsVerification;
+
+      if (ingestionResult.warnings.length > 0) {
+        this.logger.warn(`Ingestion warnings: ${ingestionResult.warnings.join(', ')}`);
+      }
+    } else {
+      // Fallback to legacy parser
+      const parsedDocs = await this.documentParser.parseAllAttachments(groupAttachments);
+
+      for (const doc of parsedDocs) {
+        if (doc.rfqNumber && !clientRfqNumber) {
+          clientRfqNumber = doc.rfqNumber;
+        }
+
+        for (const item of doc.items) {
+          allItems.push({
+            ...item,
+            brand: item.brand || group.brand,
+            notes: item.notes || `Source: ${doc.filename}`,
+          });
+        }
+
+        if (doc.needsVerification) {
+          needsManualReview = true;
+        }
+      }
+    }
+
+    // 4. Si aucun item, créer un item générique
+    if (allItems.length === 0) {
+      allItems.push({
+        description: 'Article à définir - voir documents joints',
+        quantity: 1,
+        brand: group.brand,
+        notes: 'Veuillez consulter les pièces jointes pour les détails',
+      });
+    }
+
+    // 5. Extraire les exigences client
+    const clientRequirements = extractClientRequirements(
+      email.subject,
+      email.body,
+      email.replyTo,
+    );
+
+    if (hasImportantRequirements(clientRequirements)) {
+      this.logger.log(`Exigences client détectées: ${JSON.stringify(clientRequirements)}`);
+    }
+
+    const defaultDeadlineHours = 24;
+    const deadline = clientRequirements.responseDeadlineDate
+      ? clientRequirements.responseDeadlineDate
+      : calculateDeadlineWithBusinessHours(email.date, defaultDeadlineHours);
+
+    // 6. Créer la demande de prix
+    const priceRequest: PriceRequest = {
+      requestNumber: internalRfqNumber,
+      date: new Date(),
+      items: allItems,
+      notes: group.brand ? `Marque: ${group.brand}` : `Réf. interne: ${internalRfqNumber}`,
+      deadline,
+      responseDeadlineHours: clientRequirements.responseDeadlineDate
+        ? Math.ceil((clientRequirements.responseDeadlineDate.getTime() - Date.now()) / (1000 * 60 * 60))
+        : defaultDeadlineHours,
+      needsManualReview,
+      clientRequirements,
+      sourceEmail: email,
+      // Ajouter les fiches techniques et images comme pièces jointes supplémentaires
+      additionalAttachments: [
+        ...group.technicalSheets.map(ts => ts.attachment),
+        ...images.map(img => img.attachment),
+      ],
+    };
+
+    // 7. Générer le fichier Excel
+    const generated = await this.excelService.generatePriceRequestExcel(priceRequest);
+
+    // 8. Créer le mapping dans la base de données
+    const mapping = await this.databaseService.createRfqMapping({
+      clientId: client?.id,
+      clientRfqNumber,
+      internalRfqNumber,
+      emailId: email.id,
+      messageId: email.messageId,
+      emailSubject: email.subject,
+      receivedAt: email.date,
+      status: 'processed',
+      excelPath: generated.excelPath,
+      mailbox: this.currentMailbox,
+    });
+
+    // 9. Créer un brouillon
+    if (autoSendDraft) {
+      const senderEmail = this.extractEmail(email.from);
+      const senderName = this.extractName(email.from);
+      const clientName = client?.name || senderName || this.extractCompanyFromEmail(senderEmail);
+
+      // Collecter toutes les pièces jointes supplémentaires
+      const attachmentPaths = [
+        ...group.technicalSheets.map(ts => ts.attachment.filename),
+        ...images.map(img => img.attachment.filename),
+      ];
+
+      const draftId = await this.databaseService.createPendingDraft({
+        rfqMappingId: mapping?.id,
+        internalRfqNumber,
+        clientRfqNumber,
+        clientName,
+        clientEmail: senderEmail,
+        recipient: 'procurement@multipartsci.com',
+        subject: `Demande de Prix N° ${internalRfqNumber}${group.brand ? ` - ${group.brand}` : ''}${clientRfqNumber ? ` - Réf. Client: ${clientRfqNumber}` : ''}`,
+        excelPath: generated.excelPath,
+        attachmentPaths,
+      });
+
+      await this.databaseService.addOutputLog({
+        draftId,
+        rfqMappingId: mapping?.id,
+        internalRfqNumber,
+        clientRfqNumber,
+        clientName,
+        recipient: 'procurement@multipartsci.com',
+        subject: `Demande de Prix N° ${internalRfqNumber}`,
+        excelPath: generated.excelPath,
+        action: 'draft_created',
+        status: 'pending',
+      });
+
+      this.logger.log(`Brouillon créé: ${draftId}${group.brand ? ` (${group.brand})` : ''}`);
+
+      // Sauvegarder dans IMAP Drafts
+      try {
+        // Préparer les pièces jointes pour le brouillon
+        const draftAttachments = [
+          {
+            filename: `${internalRfqNumber}.xlsx`,
+            content: generated.excelBuffer,
+            contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          },
+          // Ajouter les fiches techniques
+          ...group.technicalSheets.map(ts => ({
+            filename: ts.attachment.filename,
+            content: ts.attachment.content,
+            contentType: ts.attachment.contentType,
+          })),
+        ];
+
+        await this.draftService.saveToDrafts({
+          to: 'procurement@multipartsci.com',
+          subject: `Demande de Prix N° ${internalRfqNumber}${group.brand ? ` - ${group.brand}` : ''}${clientRfqNumber ? ` - Réf. Client: ${clientRfqNumber}` : ''}`,
+          body: this.generateEmailBodyForProcurement(
+            internalRfqNumber,
+            clientRfqNumber,
+            clientName,
+            senderEmail,
+            allItems.length,
+            group.technicalSheets.length,
+          ),
+          attachments: draftAttachments,
+        });
+      } catch (error) {
+        this.logger.warn(`Impossible de sauvegarder dans IMAP Drafts: ${error.message}`);
+      }
+
+      if (mapping) {
+        await this.databaseService.updateRfqMappingStatus(mapping.id, 'draft_pending');
+      }
+    }
+
+    // 10. Logger le succès
+    await this.databaseService.addProcessingLog({
+      rfqMappingId: mapping?.id,
+      emailId: email.id,
+      action: 'process',
+      status: 'success',
+      message: `Traité avec succès. RFQ interne: ${internalRfqNumber}${group.brand ? ` (${group.brand})` : ''}, Items: ${allItems.length}, Fiches tech: ${group.technicalSheets.length}`,
+    });
+
+    // 11. Ajouter au fichier de suivi RFQ
+    try {
+      const trackSenderEmail = this.extractEmail(email.from);
+      const trackSenderName = this.extractName(email.from);
+      const trackClientName = client?.name || trackSenderName || this.extractCompanyFromEmail(trackSenderEmail);
+
+      await this.trackingService.addEntry({
+        timestamp: new Date(),
+        clientRfqNumber,
+        internalRfqNumber,
+        clientName: trackClientName,
+        clientEmail: trackSenderEmail,
+        subject: email.subject,
+        itemCount: allItems.length,
+        status: 'traité',
+        acknowledgmentSent: false,
+        notes: `${allItems.length} article(s)${group.brand ? `, marque: ${group.brand}` : ''}${group.technicalSheets.length > 0 ? `, ${group.technicalSheets.length} fiche(s) tech.` : ''}`,
+      });
+    } catch (trackError) {
+      this.logger.warn('Erreur tracking: ' + trackError.message);
+    }
+
+    return {
+      internalRfqNumber,
+      clientRfqNumber,
+      excelPath: generated.excelPath,
+      brand: group.brand,
+      itemCount: allItems.length,
+      technicalSheets: group.technicalSheets.map(ts => ts.attachment.filename),
+    };
+  }
+
+  /**
+   * Traitement classique d'un email (fallback quand pas de classification)
+   */
+  private async processEmailClassic(email: ParsedEmail, autoSendDraft: boolean): Promise<{
+    internalRfqNumber: string;
+    clientRfqNumber?: string;
+    excelPath: string;
+  }> {
     // 1. Identifier ou créer le client
     const client = await this.findOrCreateClient(email);
 
@@ -264,7 +665,24 @@ export class AutoProcessorService {
       });
     }
 
-    // 5. Le numéro RFQ interne est déjà généré plus haut
+    // 5. Extraire les exigences client (délai de réponse, adresse de réponse, urgence)
+    const clientRequirements = extractClientRequirements(
+      email.subject,
+      email.body,
+      email.replyTo,
+    );
+
+    // Log si exigences importantes détectées
+    if (hasImportantRequirements(clientRequirements)) {
+      this.logger.log(`⚠️ Exigences client détectées: ${JSON.stringify(clientRequirements)}`);
+    }
+
+    // Calculer le délai en tenant compte des heures ouvrées
+    // Si le client a spécifié un délai, l'utiliser, sinon délai par défaut de 24h
+    const defaultDeadlineHours = 24;
+    const deadline = clientRequirements.responseDeadlineDate
+      ? clientRequirements.responseDeadlineDate
+      : calculateDeadlineWithBusinessHours(email.date, defaultDeadlineHours);
 
     // 6. Créer la demande de prix (SANS infos client dans le corps)
     const priceRequest: PriceRequest = {
@@ -273,8 +691,13 @@ export class AutoProcessorService {
       // PAS de supplier ni supplierEmail ici - anonymisé
       items: allItems,
       notes: `Réf. interne: ${internalRfqNumber}`,
-      deadline: this.calculateDeadline(14),
+      deadline,
+      responseDeadlineHours: clientRequirements.responseDeadlineDate
+        ? Math.ceil((clientRequirements.responseDeadlineDate.getTime() - Date.now()) / (1000 * 60 * 60))
+        : defaultDeadlineHours,
       needsManualReview,
+      clientRequirements, // Ajouter les exigences client pour affichage en ROUGE
+      sourceEmail: email, // Pour la date de réception
     };
 
     // 7. Générer le fichier Excel
@@ -286,10 +709,12 @@ export class AutoProcessorService {
       clientRfqNumber,
       internalRfqNumber,
       emailId: email.id,
+      messageId: email.messageId, // Pour déduplication cross-mailbox
       emailSubject: email.subject,
       receivedAt: email.date,
       status: 'processed',
       excelPath: generated.excelPath,
+      mailbox: this.currentMailbox, // Adresse email qui a traité le message
     });
 
     // 9. Créer un brouillon en attente (envoi automatique au prochain cycle)
@@ -464,10 +889,16 @@ export class AutoProcessorService {
     clientName: string | undefined,
     clientEmail: string,
     itemsCount: number,
+    technicalSheetsCount: number = 0,
   ): string {
     const responseHours = 24;
     const deadlineDate = new Date();
     deadlineDate.setHours(deadlineDate.getHours() + responseHours);
+
+    let techSheetsInfo = '';
+    if (technicalSheetsCount > 0) {
+      techSheetsInfo = `\nFiches techniques jointes: ${technicalSheetsCount}`;
+    }
 
     return `Bonjour,
 
@@ -478,7 +909,7 @@ INFORMATIONS DEMANDE
 ═══════════════════════════════════════════════════════
 N° Demande interne: ${internalRfqNumber}
 Date: ${new Date().toLocaleDateString('fr-FR')}
-Nombre d'articles: ${itemsCount}
+Nombre d'articles: ${itemsCount}${techSheetsInfo}
 Délai de réponse: ${responseHours}h (avant le ${deadlineDate.toLocaleDateString('fr-FR')} ${deadlineDate.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })})
 
 ═══════════════════════════════════════════════════════
@@ -494,7 +925,7 @@ INSTRUCTIONS
 1. Ouvrir le fichier Excel joint
 2. Rechercher les prix fournisseurs
 3. Compléter les colonnes "Prix Unitaire HT"
-4. Retourner le fichier complété
+4. Retourner le fichier complété${technicalSheetsCount > 0 ? '\n5. Consulter les fiches techniques jointes pour les spécifications' : ''}
 
 ---
 Ce message a été généré automatiquement par le système de gestion des demandes de prix.

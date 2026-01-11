@@ -52,12 +52,36 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
       const buffer = fs.readFileSync(this.dbPath);
       this.db = new SQL.Database(buffer);
       this.logger.log('Base de données chargée depuis fichier');
+      // Exécuter les migrations sur les bases existantes
+      this.runMigrations();
     } else {
       this.db = new SQL.Database();
       this.createTables();
       this.seedDefaultData();
       this.logger.log('Nouvelle base de données créée');
     }
+  }
+
+  /**
+   * Exécute les migrations sur les bases de données existantes
+   */
+  private runMigrations() {
+    // Migration: add message_id column if not exists
+    try {
+      this.db.run(`ALTER TABLE rfq_mappings ADD COLUMN message_id TEXT`);
+      this.logger.log('Migration: colonne message_id ajoutée');
+    } catch (e) { /* column exists */ }
+
+    // Migration: add mailbox column if not exists
+    try {
+      this.db.run(`ALTER TABLE rfq_mappings ADD COLUMN mailbox TEXT`);
+      this.logger.log('Migration: colonne mailbox ajoutée');
+    } catch (e) { /* column exists */ }
+
+    // Créer les index manquants
+    try {
+      this.db.run(`CREATE INDEX IF NOT EXISTS idx_rfq_message_id ON rfq_mappings(message_id)`);
+    } catch (e) { /* index exists */ }
   }
 
   private createTables() {
@@ -85,20 +109,31 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
         client_rfq_number TEXT,
         internal_rfq_number TEXT NOT NULL,
         email_id TEXT,
+        message_id TEXT,
         email_subject TEXT,
         received_at TEXT,
         processed_at TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'pending',
         excel_path TEXT,
         notes TEXT,
+        mailbox TEXT,
         FOREIGN KEY (client_id) REFERENCES clients(id)
       )
     `);
+
+    // Migration: add message_id column if not exists
+    try {
+      this.db.run(`ALTER TABLE rfq_mappings ADD COLUMN message_id TEXT`);
+    } catch (e) { /* column exists */ }
+    try {
+      this.db.run(`ALTER TABLE rfq_mappings ADD COLUMN mailbox TEXT`);
+    } catch (e) { /* column exists */ }
 
     // Index pour recherche rapide
     this.db.run(`CREATE INDEX IF NOT EXISTS idx_rfq_client ON rfq_mappings(client_id)`);
     this.db.run(`CREATE INDEX IF NOT EXISTS idx_rfq_client_number ON rfq_mappings(client_rfq_number)`);
     this.db.run(`CREATE INDEX IF NOT EXISTS idx_rfq_internal ON rfq_mappings(internal_rfq_number)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_rfq_message_id ON rfq_mappings(message_id)`);
 
     // Table Configuration
     this.db.run(`
@@ -391,20 +426,22 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     const now = new Date().toISOString();
 
     this.db.run(`
-      INSERT INTO rfq_mappings (id, client_id, client_rfq_number, internal_rfq_number, email_id, email_subject, received_at, processed_at, status, excel_path, notes)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO rfq_mappings (id, client_id, client_rfq_number, internal_rfq_number, email_id, message_id, email_subject, received_at, processed_at, status, excel_path, notes, mailbox)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `, [
       id,
       mapping.clientId || null,
       mapping.clientRfqNumber || null,
       mapping.internalRfqNumber,
       mapping.emailId || null,
+      mapping.messageId || null,
       mapping.emailSubject || null,
       mapping.receivedAt?.toISOString() || null,
       now,
       mapping.status || 'pending',
       mapping.excelPath || null,
       mapping.notes || null,
+      mapping.mailbox || null,
     ]);
 
     this.saveToFile();
@@ -460,12 +497,14 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
       clientRfqNumber: obj.client_rfq_number,
       internalRfqNumber: obj.internal_rfq_number,
       emailId: obj.email_id,
+      messageId: obj.message_id,
       emailSubject: obj.email_subject,
       receivedAt: obj.received_at ? new Date(obj.received_at) : undefined,
       processedAt: new Date(obj.processed_at),
       status: obj.status,
       excelPath: obj.excel_path,
       notes: obj.notes,
+      mailbox: obj.mailbox,
     };
   }
 
@@ -563,11 +602,27 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  // Vérifier si un email a déjà été traité
+  // Vérifier si un email a déjà été traité (par UID IMAP)
   async isEmailProcessed(emailId: string): Promise<boolean> {
     const result = this.db.exec(`SELECT COUNT(*) as count FROM rfq_mappings WHERE email_id = ?`, [emailId]);
     if (result.length === 0) return false;
     return result[0].values[0][0] > 0;
+  }
+
+  // Vérifier si un message a déjà été traité par son Message-ID (cross-mailbox deduplication)
+  async isMessageIdProcessed(messageId: string): Promise<boolean> {
+    if (!messageId) return false;
+    const result = this.db.exec(`SELECT COUNT(*) as count FROM rfq_mappings WHERE message_id = ?`, [messageId]);
+    if (result.length === 0) return false;
+    return result[0].values[0][0] > 0;
+  }
+
+  // Obtenir le RFQ mapping par Message-ID
+  async getRfqMappingByMessageId(messageId: string): Promise<RfqMapping | null> {
+    if (!messageId) return null;
+    const result = this.db.exec(`SELECT * FROM rfq_mappings WHERE message_id = ?`, [messageId]);
+    if (result.length === 0 || result[0].values.length === 0) return null;
+    return this.mapRowToRfqMapping(result[0].columns, result[0].values[0]);
   }
 
   // ============ PENDING DRAFTS (Brouillons en attente) ============
@@ -952,5 +1007,46 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
   async removeKnownSupplier(id: string): Promise<void> {
     this.db.run(`DELETE FROM known_suppliers WHERE id = ?`, [id]);
     this.saveToFile();
+  }
+
+  // ============ RESET FOR TESTING ============
+
+  /**
+   * Réinitialise les tables de traitement pour permettre de retraiter tous les emails.
+   * Conserve: clients, detection_keywords, processing_config, known_suppliers
+   * Vide: rfq_mappings, processing_logs, pending_drafts, output_logs
+   */
+  async resetProcessingData(): Promise<{
+    rfqMappings: number;
+    processingLogs: number;
+    pendingDrafts: number;
+    outputLogs: number;
+  }> {
+    // Compter les enregistrements avant suppression
+    const countRfq = this.db.exec(`SELECT COUNT(*) FROM rfq_mappings`);
+    const countLogs = this.db.exec(`SELECT COUNT(*) FROM processing_logs`);
+    const countDrafts = this.db.exec(`SELECT COUNT(*) FROM pending_drafts`);
+    const countOutput = this.db.exec(`SELECT COUNT(*) FROM output_logs`);
+
+    const counts = {
+      rfqMappings: countRfq[0]?.values[0]?.[0] || 0,
+      processingLogs: countLogs[0]?.values[0]?.[0] || 0,
+      pendingDrafts: countDrafts[0]?.values[0]?.[0] || 0,
+      outputLogs: countOutput[0]?.values[0]?.[0] || 0,
+    };
+
+    // Vider les tables
+    this.db.run(`DELETE FROM rfq_mappings`);
+    this.db.run(`DELETE FROM processing_logs`);
+    this.db.run(`DELETE FROM pending_drafts`);
+    this.db.run(`DELETE FROM output_logs`);
+
+    // Réinitialiser last_processed_at dans la config
+    this.db.run(`UPDATE processing_config SET last_processed_at = NULL`);
+
+    this.saveToFile();
+    this.logger.warn(`🔄 RESET: Données de traitement réinitialisées - RFQ: ${counts.rfqMappings}, Logs: ${counts.processingLogs}, Drafts: ${counts.pendingDrafts}, Output: ${counts.outputLogs}`);
+
+    return counts;
   }
 }

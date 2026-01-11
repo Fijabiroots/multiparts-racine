@@ -215,12 +215,13 @@ export class ExcelService {
     instructionsCell.value = 'INSTRUCTIONS: Veuillez remplir les cellules jaunes (Prix Unitaire HT) et retourner ce document complété.';
     instructionsCell.font = { italic: true, color: { argb: 'FF666666' } };
 
-    if (priceRequest.notes) {
-      sheet.mergeCells(`A${startRow + 1}:H${startRow + 2}`);
-      const notesCell = sheet.getCell(`A${startRow + 1}`);
-      notesCell.value = `Notes: ${priceRequest.notes}`;
-      notesCell.alignment = { wrapText: true };
-    }
+    // Notes désactivées - contenaient des infos du demandeur non pertinentes
+    // if (priceRequest.notes) {
+    //   sheet.mergeCells(`A${startRow + 1}:H${startRow + 2}`);
+    //   const notesCell = sheet.getCell(`A${startRow + 1}`);
+    //   notesCell.value = `Notes: ${priceRequest.notes}`;
+    //   notesCell.alignment = { wrapText: true };
+    // }
 
     // Conditions
     //sheet.mergeCells(`A${startRow + 4}:H${startRow + 6}`);

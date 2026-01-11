@@ -29,6 +29,46 @@ export interface ExtractedDocumentData {
 export class DocumentParserService {
   private readonly logger = new Logger(DocumentParserService.name);
 
+  /**
+   * Vérifie si une ligne contient des métadonnées d'email à ignorer
+   */
+  private isEmailMetadata(text: string): boolean {
+    const emailPatterns = [
+      /^(From|To|Cc|Bcc|Subject|Sent|Date|Re:|Fwd:|De:|À:|Objet:)\s*:/i,
+      /^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+\w+\s+\d{1,2},?\s+\d{4}/i,
+      /^(Lundi|Mardi|Mercredi|Jeudi|Vendredi|Samedi|Dimanche),?\s+\d{1,2}\s+\w+\s+\d{4}/i,
+      /^\s*(From|Sent|Subject|To|Cc)\s+/i,
+      /\d{1,2}:\d{2}\s*(AM|PM)?\s*$/i, // Heures d'envoi
+    ];
+    return emailPatterns.some(p => p.test(text));
+  }
+
+  /**
+   * Vérifie si une ligne contient des informations légales d'entreprise à ignorer
+   */
+  private isCompanyHeader(text: string): boolean {
+    const companyPatterns = [
+      /\b(Capital\s+social|RCCM|RC\s*:|NIF|SIRET|SIREN)\b/i,
+      /\b(Bon\s+de\s+commande|Purchase\s+Order)\b.*\b(Num[eé]ro|Number|No\.?)\b/i,
+      /\bTEL\/FAX\s*:/i,
+      /\bBP\s+\d+\s+Abidjan/i,
+      /\bC[oô]te\s+d['']?Ivoire\b/i,
+      /\bSoci[eé]t[eé]\s+de\s+Mines/i,
+      /\bEndeavour\s+Mining\b.*\b(Si[eè]ge|rue|ancien)\b/i,
+      /^\s*CIV\s*$/i, // Code pays seul
+    ];
+    return companyPatterns.some(p => p.test(text));
+  }
+
+  /**
+   * Vérifie si une quantité est valide (pas un numéro de commande/référence)
+   */
+  private isValidQuantity(qty: number): boolean {
+    // Les quantités > 100000 sont probablement des numéros de commande
+    // Les quantités typiques sont entre 1 et 10000
+    return qty > 0 && qty <= 100000;
+  }
+
   // Patterns pour extraire le numéro RFQ
   private readonly rfqPatterns = [
     /Purchase\s+Requisitions?\s+No[:\s]*(\d+)/gi,
@@ -792,14 +832,63 @@ export class DocumentParserService {
   // ============ IMAGE PARSING ============
 
   /**
+   * Vérifie si une image est une image de signature/Outlook à ignorer
+   */
+  private isSignatureImage(filename: string, size?: number): boolean {
+    const lowerName = filename.toLowerCase();
+
+    // Pattern: Images contenant "outlook" n'importe où
+    if (/outlook/i.test(lowerName)) return true;
+
+    // Pattern: Images génériques inline (image001.png, image002.jpg)
+    if (/^image\d+\./i.test(lowerName)) return true;
+
+    // Pattern: Images contenant "logo"
+    if (/logo/i.test(lowerName)) return true;
+
+    // Pattern: Images de signature courantes
+    if (/^(signature|footer|banner|header)/i.test(lowerName)) return true;
+
+    // Pattern: Images inline Microsoft (ATT00001.png)
+    if (/^att\d+\./i.test(lowerName)) return true;
+
+    // Pattern: Fichiers se terminant par "Desc.png/jpg"
+    if (/desc\.(png|jpg|jpeg|gif)$/i.test(lowerName)) return true;
+
+    // Pattern: CID references
+    if (/^cid[:\-_]/i.test(lowerName)) return true;
+
+    // Pattern: Images avec ID hexadécimaux
+    if (/^[a-f0-9]{8,}[-_]/i.test(lowerName)) return true;
+
+    // Très petites images (< 10KB) sont probablement des icônes/spacers
+    if (size && size < 10000) return true;
+
+    return false;
+  }
+
+  /**
    * Parse une image (plaque signalétique, photo de pièce, etc.)
    * Utilise OCR pour extraire le texte et identifie les informations clés
    */
   private async parseImage(attachment: EmailAttachment): Promise<ExtractedDocumentData> {
+    // Filtrer les images de signature/Outlook AVANT tout traitement
+    if (this.isSignatureImage(attachment.filename, attachment.size)) {
+      this.logger.debug(`Image de signature ignorée: ${attachment.filename}`);
+      return {
+        filename: attachment.filename,
+        type: 'image' as any,
+        text: '',
+        items: [],
+        needsVerification: false,
+        extractionMethod: 'skipped_signature',
+      };
+    }
+
     let text = '';
     let extractionMethod = 'image_ocr';
     const items: PriceRequestItem[] = [];
-    
+
     // Sauvegarder l'image temporairement pour OCR
     const tmpDir = os.tmpdir();
     const tmpPath = path.join(tmpDir, `img_${Date.now()}_${attachment.filename}`);
@@ -1029,12 +1118,23 @@ export class DocumentParserService {
 
   private extractPurchaseRequisitionItems(text: string): PriceRequestItem[] {
     const items: PriceRequestItem[] = [];
-    
+
     this.logger.debug('=== Début extraction Purchase Requisition ===');
-    
+
     // Nettoyer le texte
     const cleanText = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
     const lines = cleanText.split('\n');
+
+    // =====================================================
+    // MÉTHODE PRIORITAIRE: Extraction par numéro de ligne (10, 20, 30...)
+    // Format: "10 3 EA 710 0321 TRANSMISSION ASSY" ou similaire
+    // =====================================================
+
+    const lineBasedItems = this.extractItemsByLineNumber(cleanText);
+    if (lineBasedItems.length > 0) {
+      this.logger.log(`Méthode ligne numérotée: ${lineBasedItems.length} items extraits`);
+      return lineBasedItems;
+    }
     
     // =====================================================
     // MÉTHODE 0: Recherche directe du pattern dans tout le texte (NOUVELLE)
@@ -1056,13 +1156,25 @@ export class DocumentParserService {
       const unit = globalMatch[3];
       const itemCode = globalMatch[4];
       let description = globalMatch[5].trim();
-      
+
       // Nettoyer la description
       description = description.replace(/\s+1500\d+.*$/i, '').trim();
       description = description.replace(/\s+\d+\s+\d+\s*(USD|EUR|XOF)?.*$/i, '').trim();
       description = description.replace(/\s+0\s+0\s*$/i, '').trim();
       description = description.replace(/\s{2,}/g, ' ').trim();
-      
+
+      // FILTRE: Ignorer les métadonnées d'email et en-têtes d'entreprise
+      if (this.isEmailMetadata(description) || this.isCompanyHeader(description)) {
+        this.logger.debug(`Item ignoré (metadata/header): "${description.substring(0, 50)}..."`);
+        continue;
+      }
+
+      // FILTRE: Vérifier que la quantité est valide
+      if (!this.isValidQuantity(qty)) {
+        this.logger.debug(`Item ignoré (qty invalide ${qty}): "${description.substring(0, 50)}..."`);
+        continue;
+      }
+
       if (description.length > 5 && !foundItems.has(itemCode)) {
         foundItems.set(itemCode, { qty, unit, desc: description, lineNum });
         this.logger.debug(`Méthode 0 - Item trouvé: Code=${itemCode}, Qty=${qty}, Desc="${description.substring(0, 50)}..."`);
@@ -1595,5 +1707,136 @@ export class DocumentParserService {
     }
 
     return result;
+  }
+
+  // ============ NOUVEAU PARSER PAR NUMÉRO DE LIGNE ============
+
+  /**
+   * Extraction basée sur les lignes numérotées (10, 20, 30...)
+   * Les tableaux dans les PDFs Purchase Requisition utilisent ce format
+   */
+  private extractItemsByLineNumber(fullText: string): PriceRequestItem[] {
+    const items: PriceRequestItem[] = [];
+    const normalized = fullText.replace(/\r/g, '');
+
+    // Extraire les lignes candidates (commencent par un numéro de ligne)
+    const candidates = normalized
+      .split(/\n+/)
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .filter((s) => /^\d{1,3}\s+/.test(s));
+
+    this.logger.debug(`Lignes candidates trouvées: ${candidates.length}`);
+
+    for (const raw of candidates) {
+      const parsed = this.parseLineRow(raw);
+      if (parsed) {
+        // Enrichir avec marque et code fournisseur
+        parsed.brand = this.extractBrandFromDesc(parsed.description || '');
+        parsed.supplierCode = this.extractSupplierCodeFromDesc(parsed.description || '');
+
+        // Nettoyer la description
+        if (parsed.description) {
+          parsed.description = this.cleanPRDescription(parsed.description);
+        }
+
+        items.push(parsed);
+        this.logger.debug(
+          `Item ligne ${parsed.originalLine}: Qty=${parsed.quantity}, Desc="${(parsed.description || '').substring(0, 50)}..."`,
+        );
+      }
+    }
+
+    return items;
+  }
+
+  /**
+   * Parser une ligne de tableau PR
+   * Heuristique multi-modèles pour supporter différents formats
+   */
+  private parseLineRow(raw: string): PriceRequestItem | null {
+    const parts = raw.trim().split(/\s+/);
+
+    // Numéro de ligne (10, 20, 30...)
+    const lineNo = Number(parts[0]);
+    if (!Number.isFinite(lineNo) || lineNo < 1 || lineNo > 999) return null;
+
+    // Quantité (deuxième élément)
+    const qty = Number(parts[1]);
+    const qtyVal = Number.isFinite(qty) && qty > 0 && qty <= 100000 ? qty : null;
+
+    // Si pas de quantité valide, ignorer cette ligne
+    if (!qtyVal) return null;
+
+    // UOM (troisième élément)
+    const uom = parts[2] ?? null;
+    const validUoms = ['EA', 'PCS', 'PC', 'KG', 'M', 'L', 'SET', 'UNIT', 'LOT', 'OFF', 'EACH'];
+    const isValidUom = uom && validUoms.includes(uom.toUpperCase());
+
+    let idx = isValidUom ? 3 : 2;
+
+    // Item Code (code numérique 5-6 chiffres)
+    let itemCode: string | null = null;
+    if (parts[idx] && /^\d{5,8}$/.test(parts[idx])) {
+      itemCode = parts[idx];
+      idx++;
+    }
+
+    // Part Number (peut contenir des tirets, espaces, slashes)
+    let partNumber: string | null = null;
+
+    // Cas spécial: Part Number en deux parties (ex: "710 0321")
+    if (
+      parts[idx] &&
+      parts[idx + 1] &&
+      /^\d{3}$/.test(parts[idx]) &&
+      /^\d{4}$/.test(parts[idx + 1])
+    ) {
+      partNumber = `${parts[idx]} ${parts[idx + 1]}`;
+      idx += 2;
+    }
+    // Part Number standard avec tiret/slash
+    else if (parts[idx] && /[-\/]/.test(parts[idx])) {
+      partNumber = parts[idx];
+      idx++;
+    }
+    // Part Number alphanumérique (ex: KI38822-0004-1)
+    else if (parts[idx] && /^[A-Z]{1,3}\d+/i.test(parts[idx])) {
+      partNumber = parts[idx];
+      idx++;
+    }
+
+    // Le reste est la description
+    let description = parts.slice(idx).join(' ').trim();
+
+    // Nettoyer la description (enlever codes GL, prix, etc.)
+    description = description.replace(/\s+1500\d+.*$/i, '').trim();
+    description = description.replace(/\s+\d+\s+(USD|EUR|XOF).*$/i, '').trim();
+    description = description.replace(/\s+0\s+0\s*$/i, '').trim();
+    description = description.replace(/\s{2,}/g, ' ').trim();
+
+    // Validation: description doit avoir au moins 5 caractères
+    if (!description || description.length < 5) return null;
+
+    // Ignorer les lignes qui sont des en-têtes ou totaux
+    const descLower = description.toLowerCase();
+    if (
+      descLower.includes('total') ||
+      descLower.includes('grand total') ||
+      descLower.startsWith('line') ||
+      descLower.startsWith('quantity')
+    ) {
+      return null;
+    }
+
+    return {
+      originalLine: lineNo,
+      quantity: qtyVal,
+      unit: isValidUom ? (uom!.toUpperCase() === 'EA' ? 'pcs' : uom!.toLowerCase()) : 'pcs',
+      internalCode: itemCode || undefined,
+      supplierCode: partNumber?.replace(/\s+/g, '') || undefined,
+      reference: partNumber || itemCode || undefined,
+      description: description,
+    };
   }
 }

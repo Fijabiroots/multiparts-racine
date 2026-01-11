@@ -4,7 +4,6 @@ import {
   DetectedColumn,
   COLUMN_DICTIONARY,
   COLUMN_WEIGHTS,
-  TextToken,
   ParsedRow,
   NormalizedDocument,
 } from './types';
@@ -30,23 +29,12 @@ interface BrandsFile {
 }
 
 /**
- * Configuration for table parsing
- */
-export interface TableParserConfig {
-  minHeaderScore?: number;        // Minimum score to consider as header (0-1)
-  maxHeaderSearchLines?: number;  // Max lines to search for header
-  fuzzyMatchThreshold?: number;   // Fuzzy match threshold (0-1)
-  mergeMultilineDescriptions?: boolean;
-}
-
-/**
  * Header detection result
  */
 export interface HeaderDetection {
   found: boolean;
   score: number;
   lineIndex: number;
-  pageIndex?: number;
   columns: DetectedColumn[];
   rawHeaderText: string;
 }
@@ -58,37 +46,105 @@ export interface TableExtractionResult {
   items: PriceRequestItem[];
   headerDetection: HeaderDetection;
   warnings: string[];
-  extractionMethod: 'positions' | 'columns' | 'heuristic';
+  extractionMethod: 'header-based' | 'heuristic';
 }
 
 /**
- * Default parser configuration
+ * Configuration for table parsing
  */
-const DEFAULT_CONFIG: Required<TableParserConfig> = {
-  minHeaderScore: 8,              // Score pondéré minimum (était 0.3 en %)
-  maxHeaderSearchLines: 30,
-  fuzzyMatchThreshold: 0.75,      // Seuil fuzzy légèrement plus strict
-  mergeMultilineDescriptions: true,
-};
+export interface TableParserConfig {
+  minHeaderScore?: number;
+  maxHeaderSearchLines?: number;
+}
 
-/**
- * Unified Table Parser Service
- *
- * Provides consistent table parsing across different document types:
- * - PDF (with X/Y positions)
- * - Excel (column-based)
- * - Word/Email (text heuristics)
- *
- * Uses header detection with fuzzy matching to identify columns.
- */
-/**
- * Path to the brands JSON file
- */
+// ============================================================================
+// COLONNES ESSENTIELLES À EXTRAIRE (mapping vers PriceRequestItem)
+// ============================================================================
+
+// Ces types seront mappés vers les champs de PriceRequestItem
+const ESSENTIAL_COLUMN_TYPES: ColumnType[] = [
+  'qty',           // -> quantity
+  'uom',           // -> unit
+  'itemCode',      // -> internalCode, reference
+  'partNumber',    // -> supplierCode, reference
+  'brand',         // -> brand
+  'description',   // -> description
+  'remark',        // -> notes
+  'specification', // -> append to description or notes
+  'lineNo',        // -> originalLine
+];
+
+// Minimum score pour considérer une ligne comme en-tête
+const MIN_HEADER_SCORE = 8;
+
+// Lignes maximum à scanner pour trouver l'en-tête
+const MAX_HEADER_SEARCH_LINES = 40;
+
+// ============================================================================
+// PATTERNS DE BRUIT À IGNORER
+// ============================================================================
+
+const NOISE_PATTERNS = [
+  // En-têtes d'email
+  /^(From|To|Cc|Bcc|Subject|Sent|Date|Re:|Fwd:|De:|À:|Objet:)\s*:/i,
+  // Informations légales/société
+  /\b(Capital\s+social|RCCM|RC\s*:|NIF|SIRET|SIREN)\b/i,
+  /\bTEL\/FAX\s*:/i,
+  // Totaux et pieds de page
+  /^(Total|Grand Total|Sous-total|Subtotal)\s*:?\s*$/i,
+  /\b(Total\s+in\s+Equivalent|Total\s+Cost|Net\s+Total)\b/i,
+  // Pagination/Séparateurs
+  /^(Page\s+\d+\s*(of|\/|sur)\s*\d+|---+|\*\*\*+|===+)$/i,
+  // Signatures email
+  /^(Cordialement|Best regards|Regards|Sincères salutations|Kind regards)/i,
+  /^(Sent from|Envoyé depuis)/i,
+  // Labels de Purchase Requisition (métadonnées) - match avec ou sans contenu après
+  /^(Purchase\s+Requisitions?\s+No|Requisition\s+No|PR\s+Number)\s*:?/i,
+  /^(Creation\s+Date|Required\s+Date|Delivery\s+Date)\s*[\(\):]/i,
+  /\bDelivery\s+Date\(s\)\s*:/i,
+  /^(General\s+Description|Additional\s+Description|Item\s+Description)\s*:/i,
+  /^(Requestor|Requester|HOD\s+name|Buyer|Approver)\s*:?\s*$/i,
+  /^(Activity\s+Code|GL\s+Code|Cost\s+Center|Sub\s+Activity)\s*:?\s*$/i,
+  /^(Recommended\s+supplier|Preferred\s+supplier)\s*:?\s*$/i,
+  // Metadata labels (mots courts génériques)
+  /^(New\s+stock\s+item|Sole\s+supplier|Short\s+motivation|Additional|Signature)\s*,?\s*$/i,
+  /^(RECOMMENDED|ADDITIONAL|SIGNATURE|REQUISITION|REVISION)\s*$/i,
+  /^name\s*&?\s*$/i,
+  /^(ARO|OOD)\s+(for|FOR)\s*$/i,  // Labels ARO/OOD sans description
+  // En-têtes de tableau (colonnes combinées)
+  /^Line\s+Quantity\s+UOM/i,
+  /^(Line|Qty|Quantity|UOM|Item\s+Code|Part\s+Number|Description|Stock)\s*$/i,
+  // Noms de personnes (pattern: Prénom NOM ou NOM Prénom)
+  /^[A-Z][a-z]+\s+[A-Z]{2,}$/,  // Jean DUPONT
+  /^[A-Z]{2,}\s+[A-Z][a-z]+$/,  // DUPONT Jean
+  // Dates standalone
+  /^\d{1,2}[-\/](JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[-\/]\d{2,4}$/i,
+  /^\d{1,2}[-\/]\d{1,2}[-\/]\d{2,4}$/,
+  // Codes seuls sans contexte
+  /^SUB-$/i,
+  /^OFF$/i,
+  // === SIGNATURE EMAIL ===
+  // Emails
+  /^[\w\.\-]+@[\w\.\-]+\.\w+$/i,
+  /\b[\w\.\-]+@[\w\.\-]+\.(com|org|net|ci|fr|io)\b/i,
+  // Téléphones (formats internationaux)
+  /^[\*\+]?\d{3}[\s\.\-]?\d{2}[\s\.\-]?\d{2}[\s\.\-]?\d{2}[\s\.\-]?\d{2}$/,
+  /^\+?\d{1,4}[\s\.\-]?\d{2,3}[\s\.\-]?\d{2,3}[\s\.\-]?\d{2,3}[\s\.\-]?\d{2,3}$/,
+  /^\*\+\d{3}/,  // Pattern *+225...
+  // URLs et sites web
+  /^(https?:\/\/|www\.)/i,
+  /\bwww\.\w+\.\w+/i,
+  /<https?:\/\//i,
+  // Adresses postales
+  /\b\d+,?\s+(Avenue|Rue|Boulevard|Street|Road|Place)\b/i,
+  /\b(Abidjan|Paris|London|Accra|Dakar|Lagos)\b.*\b(Côte d'Ivoire|France|Ghana|Senegal|Nigeria)?\b/i,
+  /\bBP\s+\d+\b/i,  // Boîte postale
+  // Numéros de téléphone avec préfixes
+  /^(Tel|Tél|Phone|Fax|Mobile|Cell)\s*[:.]?\s*[\+\d]/i,
+];
+
 const BRANDS_FILE_PATH = path.join(process.cwd(), 'data', 'brands_grouped_by_category.json');
 
-/**
- * Fallback brands list (used when JSON file is not available)
- */
 const FALLBACK_BRANDS = [
   'CATERPILLAR', 'CAT', 'KOMATSU', 'HITACHI', 'VOLVO', 'LIEBHERR', 'SANDVIK',
   'SKF', 'FAG', 'NSK', 'NTN', 'TIMKEN', 'SIEMENS', 'ABB', 'SCHNEIDER',
@@ -96,39 +152,30 @@ const FALLBACK_BRANDS = [
   'DONALDSON', 'MANN', 'FLEETGUARD', 'GATES', 'FLUKE', 'MICHELIN', 'BRIDGESTONE',
 ];
 
+/**
+ * TableParserService - Utilise COLUMN_DICTIONARY complet
+ *
+ * Extrait les champs essentiels:
+ * - Référence (itemCode/partNumber -> supplierCode)
+ * - Désignation (description)
+ * - Marque (brand)
+ * - Quantité (qty)
+ * - Unité (uom)
+ * - Notes (remark/specification)
+ */
 @Injectable()
 export class TableParserService implements OnModuleInit {
   private readonly logger = new Logger(TableParserService.name);
-  private readonly config: Required<TableParserConfig>;
   private knownBrands: string[] = [];
   private brandsLastLoaded: Date | null = null;
 
-  constructor() {
-    this.config = { ...DEFAULT_CONFIG };
-  }
-
-  /**
-   * Update parser configuration
-   */
-  configure(config: Partial<TableParserConfig>): void {
-    Object.assign(this.config, config);
-  }
-
-  /**
-   * Initialize the service by loading brands from JSON file
-   */
   async onModuleInit(): Promise<void> {
     await this.loadBrandsFromFile();
   }
 
-  /**
-   * Load brands from JSON file
-   * Can be called to reload brands after file update
-   */
   async loadBrandsFromFile(): Promise<void> {
     try {
       if (!fs.existsSync(BRANDS_FILE_PATH)) {
-        this.logger.warn(`Brands file not found at ${BRANDS_FILE_PATH}, using fallback list`);
         this.knownBrands = FALLBACK_BRANDS;
         return;
       }
@@ -136,41 +183,29 @@ export class TableParserService implements OnModuleInit {
       const fileContent = fs.readFileSync(BRANDS_FILE_PATH, 'utf-8');
       const data: BrandsFile = JSON.parse(fileContent);
 
-      // Flatten all brands from all categories into a single array
       const allBrands = new Set<string>();
       for (const category of data.categories) {
         for (const brand of category.brands) {
-          // Normalize: uppercase and trim
           allBrands.add(brand.toUpperCase().trim());
         }
       }
 
       this.knownBrands = Array.from(allBrands);
       this.brandsLastLoaded = new Date();
-
-      this.logger.log(
-        `Loaded ${this.knownBrands.length} brands from ${BRANDS_FILE_PATH} (${data.categories.length} categories)`
-      );
+      this.logger.log(`Loaded ${this.knownBrands.length} brands`);
     } catch (error) {
-      this.logger.error(`Failed to load brands from file: ${error.message}`);
+      this.logger.error(`Failed to load brands: ${error.message}`);
       this.knownBrands = FALLBACK_BRANDS;
     }
   }
 
-  /**
-   * Get the list of known brands (for external use)
-   */
   getKnownBrands(): string[] {
     return [...this.knownBrands];
   }
 
-  /**
-   * Check if brands need reloading (file modified)
-   */
   async checkAndReloadBrands(): Promise<boolean> {
     try {
       if (!fs.existsSync(BRANDS_FILE_PATH)) return false;
-
       const stats = fs.statSync(BRANDS_FILE_PATH);
       if (!this.brandsLastLoaded || stats.mtime > this.brandsLastLoaded) {
         await this.loadBrandsFromFile();
@@ -182,58 +217,55 @@ export class TableParserService implements OnModuleInit {
     }
   }
 
+  configure(config: Partial<TableParserConfig>): void {
+    // Placeholder for configuration
+  }
+
   /**
-   * Parse a normalized document and extract items
+   * Parse un document normalisé et extrait les items
    */
   parseDocument(doc: NormalizedDocument): TableExtractionResult {
     const warnings: string[] = [];
-    let extractionMethod: 'positions' | 'columns' | 'heuristic' = 'heuristic';
 
-    // 1. Detect header
+    // 1. Détecter l'en-tête
     const headerDetection = this.detectHeader(doc);
 
     if (!headerDetection.found) {
       warnings.push('No header row detected - using heuristic parsing');
+      this.logger.warn(`No header found for ${doc.sourceName}`);
     } else {
       this.logger.debug(
-        `Header detected at line ${headerDetection.lineIndex} with score ${headerDetection.score.toFixed(2)}`
+        `Header at line ${headerDetection.lineIndex}, score ${headerDetection.score}, columns: ${headerDetection.columns.map(c => c.type).join(', ')}`
       );
     }
 
-    // 2. Extract items based on document type
+    // 2. Extraire les items
     let items: PriceRequestItem[] = [];
 
-    if (doc.hasPositions && doc.tokens && doc.tokens.length > 0) {
-      // Position-based extraction (PDF with pdfjs tokens)
-      items = this.extractWithPositions(doc.tokens, headerDetection);
-      extractionMethod = 'positions';
-    } else if (doc.tables && doc.tables.length > 0) {
-      // Column-based extraction (Excel/Word tables)
+    if (doc.tables && doc.tables.length > 0) {
       items = this.extractFromTables(doc.tables, headerDetection);
-      extractionMethod = 'columns';
     } else if (doc.rows && doc.rows.length > 0) {
-      // Heuristic extraction (text-based)
       items = this.extractFromRows(doc.rows, headerDetection);
-      extractionMethod = 'heuristic';
-    } else {
-      // Fallback: parse raw text
-      items = this.extractFromRawText(doc.rawText);
-      extractionMethod = 'heuristic';
+    } else if (doc.rawText) {
+      items = this.extractFromRawText(doc.rawText, headerDetection);
     }
 
-    // 3. Post-process items
-    items = this.postProcessItems(items, warnings);
+    this.logger.debug(`Extracted ${items.length} raw items from ${doc.sourceName}`);
+
+    // 3. Post-traitement: nettoyage et enrichissement
+    items = this.postProcessItems(items);
 
     return {
       items,
       headerDetection,
       warnings,
-      extractionMethod,
+      extractionMethod: headerDetection.found ? 'header-based' : 'heuristic',
     };
   }
 
   /**
-   * Detect header row in the document
+   * Détecte la ligne d'en-tête dans le document
+   * Utilise COLUMN_DICTIONARY complet de types.ts
    */
   detectHeader(doc: NormalizedDocument): HeaderDetection {
     const noHeader: HeaderDetection = {
@@ -244,102 +276,37 @@ export class TableParserService implements OnModuleInit {
       rawHeaderText: '',
     };
 
-    // Check rows first
+    // Vérifier les tables d'abord (Excel)
+    if (doc.tables && doc.tables.length > 0) {
+      for (const table of doc.tables) {
+        const result = this.detectHeaderInTable(table);
+        if (result.found) return result;
+      }
+    }
+
+    // Vérifier les rows (PDF/texte)
     if (doc.rows && doc.rows.length > 0) {
       return this.detectHeaderInRows(doc.rows);
     }
 
-    // Check tables
-    if (doc.tables && doc.tables.length > 0) {
-      for (let tableIdx = 0; tableIdx < doc.tables.length; tableIdx++) {
-        const table = doc.tables[tableIdx];
-        const result = this.detectHeaderInTable(table);
-        if (result.found && result.score >= this.config.minHeaderScore) {
-          return result;
-        }
-      }
-    }
-
-    // Check raw text as rows
+    // Fallback: texte brut
     if (doc.rawText) {
-      const textRows = doc.rawText.split('\n').map((line, idx) => ({
+      const rows = doc.rawText.split('\n').map((line, idx) => ({
         raw: line,
-        cells: this.splitRowIntoCells(line),
+        cells: this.splitIntoCells(line),
         lineNumber: idx,
       }));
-      return this.detectHeaderInRows(textRows);
+      return this.detectHeaderInRows(rows);
     }
 
     return noHeader;
   }
 
   /**
-   * Detect header in an array of rows
-   * Utilise une fenêtre glissante de 2 lignes pour gérer les en-têtes cassés
-   */
-  private detectHeaderInRows(rows: ParsedRow[]): HeaderDetection {
-    const maxSearch = Math.min(rows.length, this.config.maxHeaderSearchLines);
-    let bestResult: HeaderDetection = {
-      found: false,
-      score: 0,
-      lineIndex: -1,
-      columns: [],
-      rawHeaderText: '',
-    };
-
-    for (let i = 0; i < maxSearch; i++) {
-      const row = rows[i];
-      const cells = row.cells.length > 0 ? row.cells : this.splitRowIntoCells(row.raw);
-
-      // 1. Analyser la ligne seule
-      const singleLineDetection = this.analyzeHeaderCandidateRow(cells, i);
-
-      if (singleLineDetection.score > bestResult.score) {
-        bestResult = {
-          ...singleLineDetection,
-          rawHeaderText: row.raw,
-        };
-      }
-
-      // 2. Analyser 2 lignes combinées (fenêtre glissante)
-      // Utile quand l'en-tête est cassé sur 2 lignes
-      if (i + 1 < rows.length) {
-        const nextRow = rows[i + 1];
-        const nextCells = nextRow.cells.length > 0
-          ? nextRow.cells
-          : this.splitRowIntoCells(nextRow.raw);
-
-        // Combiner le texte des 2 lignes
-        const combinedText = row.raw + ' ' + nextRow.raw;
-        const combinedCells = this.splitRowIntoCells(combinedText);
-
-        const twoLineDetection = this.analyzeHeaderCandidateRow(combinedCells, i);
-
-        // Bonus pour la combinaison si elle trouve plus de colonnes clés
-        if (twoLineDetection.score > bestResult.score) {
-          bestResult = {
-            ...twoLineDetection,
-            rawHeaderText: combinedText,
-          };
-          // On skip la ligne suivante car elle fait partie de l'en-tête
-          i++;
-        }
-      }
-
-      // Early exit si on trouve un très bon en-tête (score pondéré >= 15)
-      if (bestResult.score >= 15) {
-        break;
-      }
-    }
-
-    return bestResult;
-  }
-
-  /**
-   * Detect header in a table (2D array)
+   * Détecte l'en-tête dans un tableau 2D
    */
   private detectHeaderInTable(table: string[][]): HeaderDetection {
-    const maxSearch = Math.min(table.length, this.config.maxHeaderSearchLines);
+    const maxSearch = Math.min(table.length, MAX_HEADER_SEARCH_LINES);
     let bestResult: HeaderDetection = {
       found: false,
       score: 0,
@@ -350,9 +317,9 @@ export class TableParserService implements OnModuleInit {
 
     for (let i = 0; i < maxSearch; i++) {
       const row = table[i];
-      if (!row || row.length === 0) continue;
+      if (!row || row.length < 2) continue;
 
-      const detection = this.analyzeHeaderCandidateRow(row, i);
+      const detection = this.analyzeHeaderRow(row, i);
 
       if (detection.score > bestResult.score) {
         bestResult = {
@@ -361,7 +328,7 @@ export class TableParserService implements OnModuleInit {
         };
       }
 
-      if (detection.score >= 0.8) {
+      if (detection.found && detection.score >= MIN_HEADER_SCORE) {
         break;
       }
     }
@@ -370,33 +337,78 @@ export class TableParserService implements OnModuleInit {
   }
 
   /**
-   * Analyze a row to determine if it's a header
-   * Utilise un scoring pondéré avec bonus pour combinaisons "table-like"
+   * Détecte l'en-tête dans des lignes parsées
    */
-  private analyzeHeaderCandidateRow(cells: string[], lineIndex: number): HeaderDetection {
+  private detectHeaderInRows(rows: ParsedRow[]): HeaderDetection {
+    const maxSearch = Math.min(rows.length, MAX_HEADER_SEARCH_LINES);
+    let bestResult: HeaderDetection = {
+      found: false,
+      score: 0,
+      lineIndex: -1,
+      columns: [],
+      rawHeaderText: '',
+    };
+
+    for (let i = 0; i < maxSearch; i++) {
+      const row = rows[i];
+      if (!row.raw.trim()) continue;
+
+      const cells = row.cells.length > 1 ? row.cells : this.splitIntoCells(row.raw);
+      if (cells.length < 2) continue;
+
+      const detection = this.analyzeHeaderRow(cells, i);
+
+      if (detection.score > bestResult.score) {
+        bestResult = {
+          ...detection,
+          rawHeaderText: row.raw,
+        };
+      }
+
+      if (detection.found && detection.score >= MIN_HEADER_SCORE) {
+        break;
+      }
+    }
+
+    return bestResult;
+  }
+
+  /**
+   * Analyse une ligne pour déterminer si c'est un en-tête
+   * Utilise COLUMN_DICTIONARY complet
+   */
+  private analyzeHeaderRow(cells: string[], lineIndex: number): HeaderDetection {
     const columns: DetectedColumn[] = [];
-    let weightedScore = 0;
-    const matchedTypes = new Set<ColumnType>();
+    let totalScore = 0;
+    const foundTypes = new Set<ColumnType>();
 
     for (let colIdx = 0; colIdx < cells.length; colIdx++) {
       const cell = cells[colIdx];
       if (!cell || typeof cell !== 'string') continue;
 
-      const cellNormalized = this.normalizeText(cell);
+      const normalized = this.normalizeText(cell);
+      if (normalized.length < 2) continue;
+
       let bestMatch: { type: ColumnType; score: number } | null = null;
 
-      // Try to match against all column types
+      // Chercher dans COLUMN_DICTIONARY complet
       for (const [colType, keywords] of Object.entries(COLUMN_DICTIONARY)) {
-        if (colType === 'unknown' || keywords.length === 0) continue;
+        if (colType === 'unknown' || !keywords || keywords.length === 0) continue;
 
         for (const keyword of keywords) {
           const keywordNorm = this.normalizeText(keyword);
-          const score = this.fuzzyMatch(cellNormalized, keywordNorm);
+          if (!keywordNorm) continue;
 
-          if (score >= this.config.fuzzyMatchThreshold) {
-            if (!bestMatch || score > bestMatch.score) {
-              bestMatch = { type: colType as ColumnType, score };
-            }
+          // Match exact ou contenu
+          let score = 0;
+          if (normalized === keywordNorm) {
+            score = 1.0;
+          } else if (normalized.includes(keywordNorm) || keywordNorm.includes(normalized)) {
+            score = 0.8;
+          }
+
+          if (score > 0 && (!bestMatch || score > bestMatch.score)) {
+            bestMatch = { type: colType as ColumnType, score };
           }
         }
       }
@@ -408,43 +420,26 @@ export class TableParserService implements OnModuleInit {
           score: bestMatch.score,
           columnIndex: colIdx,
         });
-        // Score pondéré par le poids de la colonne
         const weight = COLUMN_WEIGHTS[bestMatch.type] || 1;
-        weightedScore += weight * bestMatch.score;
-        matchedTypes.add(bestMatch.type);
-      } else {
-        columns.push({
-          type: 'unknown',
-          headerText: cell,
-          score: 0,
-          columnIndex: colIdx,
-        });
+        totalScore += weight * bestMatch.score;
+        foundTypes.add(bestMatch.type);
       }
     }
 
-    // Bonus pour combinaisons "table-like"
-    const hasLineNo = matchedTypes.has('lineNo');
-    const hasQty = matchedTypes.has('qty');
-    const hasUom = matchedTypes.has('uom');
-    const hasDescription = matchedTypes.has('description');
-    const hasItemCode = matchedTypes.has('itemCode');
-    const hasPartNumber = matchedTypes.has('partNumber');
+    // L'en-tête DOIT contenir description ET (qty OU itemCode/partNumber)
+    const hasDescription = foundTypes.has('description');
+    const hasQty = foundTypes.has('qty');
+    const hasCode = foundTypes.has('itemCode') || foundTypes.has('partNumber');
+    const isValidHeader = hasDescription && (hasQty || hasCode);
 
-    // Bonus: line + qty = signal fort de tableau
-    if (hasLineNo && hasQty) weightedScore += 3;
-    // Bonus: qty + uom = signal de tableau
-    if (hasQty && hasUom) weightedScore += 2;
-    // Bonus: description + (line ou qty) = très probable tableau
-    if (hasDescription && (hasLineNo || hasQty)) weightedScore += 2;
-    // Bonus: itemCode ou partNumber présent
-    if (hasItemCode || hasPartNumber) weightedScore += 1;
-
-    // Le header doit contenir au moins description OU (qty + une autre colonne clé)
-    const isValidHeader = hasDescription || (hasQty && matchedTypes.size >= 2);
+    // Bonus si on a la combo description + qty
+    if (hasDescription && hasQty) {
+      totalScore += 3;
+    }
 
     return {
-      found: weightedScore >= this.config.minHeaderScore && isValidHeader,
-      score: weightedScore,
+      found: isValidHeader && totalScore >= MIN_HEADER_SCORE,
+      score: totalScore,
       lineIndex,
       columns,
       rawHeaderText: '',
@@ -452,69 +447,23 @@ export class TableParserService implements OnModuleInit {
   }
 
   /**
-   * Extract items using X/Y positions (PDF tokens)
+   * Extrait les items depuis des tables (Excel)
    */
-  private extractWithPositions(
-    tokens: TextToken[],
-    header: HeaderDetection
-  ): PriceRequestItem[] {
-    const items: PriceRequestItem[] = [];
-
-    // Group tokens by Y position (line)
-    const lineGroups = new Map<number, TextToken[]>();
-    for (const token of tokens) {
-      // Round Y to handle minor variations
-      const roundedY = Math.round(token.y / 5) * 5;
-      if (!lineGroups.has(roundedY)) {
-        lineGroups.set(roundedY, []);
-      }
-      lineGroups.get(roundedY)!.push(token);
-    }
-
-    // Sort lines by Y position
-    const sortedYs = Array.from(lineGroups.keys()).sort((a, b) => a - b);
-
-    // Define column boundaries from header if available
-    const columnBounds: Map<ColumnType, { xStart: number; xEnd: number }> = new Map();
-
-    if (header.found && header.columns.length > 0) {
-      // Use header to define column boundaries
-      // For now, use simple column index mapping
-      // In a more sophisticated implementation, we'd use X positions from header tokens
-    }
-
-    // Process each line
-    for (const y of sortedYs) {
-      const lineTokens = lineGroups.get(y)!.sort((a, b) => a.x - b.x);
-      const lineText = lineTokens.map(t => t.text).join(' ');
-
-      // Try to parse as item line
-      const item = this.parseItemLine(lineText, header);
-      if (item) {
-        items.push(item);
-      }
-    }
-
-    return items;
-  }
-
-  /**
-   * Extract items from tables (Excel/Word)
-   */
-  private extractFromTables(
-    tables: string[][][],
-    header: HeaderDetection
-  ): PriceRequestItem[] {
+  private extractFromTables(tables: string[][][], header: HeaderDetection): PriceRequestItem[] {
     const items: PriceRequestItem[] = [];
 
     for (const table of tables) {
-      const startRow = header.found ? header.lineIndex + 1 : 0;
+      const startRow = header.found ? header.lineIndex + 1 : 1;
 
       for (let rowIdx = startRow; rowIdx < table.length; rowIdx++) {
         const row = table[rowIdx];
-        if (!row || row.length === 0) continue;
+        if (!row || row.length < 2) continue;
 
-        const item = this.extractItemFromRow(row, header.columns);
+        const rowText = row.join(' ');
+        if (this.isNoiseLine(rowText)) continue;
+        if (this.isEmptyDataRow(row)) continue;
+
+        const item = this.extractItemFromCells(row, header.columns, rowIdx);
         if (item) {
           items.push(item);
         }
@@ -525,24 +474,25 @@ export class TableParserService implements OnModuleInit {
   }
 
   /**
-   * Extract items from parsed rows
+   * Extrait les items depuis des lignes parsées
    */
-  private extractFromRows(
-    rows: ParsedRow[],
-    header: HeaderDetection
-  ): PriceRequestItem[] {
+  private extractFromRows(rows: ParsedRow[], header: HeaderDetection): PriceRequestItem[] {
     const items: PriceRequestItem[] = [];
     const startRow = header.found ? header.lineIndex + 1 : 0;
 
+    this.logger.debug(`Extracting from rows starting at ${startRow}, total rows: ${rows.length}`);
+
     for (let i = startRow; i < rows.length; i++) {
       const row = rows[i];
+      if (!row.raw.trim()) continue;
 
-      // Skip empty or continuation rows
-      if (!row.raw.trim() || row.isContinuation) continue;
+      if (this.isNoiseLine(row.raw)) continue;
 
-      const cells = row.cells.length > 0 ? row.cells : this.splitRowIntoCells(row.raw);
-      const item = this.extractItemFromRow(cells, header.columns);
+      const cells = row.cells.length > 1 ? row.cells : this.splitIntoCells(row.raw);
 
+      if (this.isEmptyDataRow(cells)) continue;
+
+      const item = this.extractItemFromCells(cells, header.columns, i);
       if (item) {
         items.push(item);
       }
@@ -552,351 +502,496 @@ export class TableParserService implements OnModuleInit {
   }
 
   /**
-   * Extract items from raw text (fallback)
+   * Extrait les items depuis du texte brut
    */
-  private extractFromRawText(text: string): PriceRequestItem[] {
-    const items: PriceRequestItem[] = [];
+  private extractFromRawText(text: string, header: HeaderDetection): PriceRequestItem[] {
     const lines = text.split('\n');
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.length < 5) continue;
-
-      const item = this.parseItemLine(trimmed, { found: false, score: 0, lineIndex: -1, columns: [], rawHeaderText: '' });
-      if (item) {
-        items.push(item);
-      }
-    }
-
-    return items;
+    const rows: ParsedRow[] = lines.map((line, idx) => ({
+      raw: line,
+      cells: this.splitIntoCells(line),
+      lineNumber: idx,
+    }));
+    return this.extractFromRows(rows, header);
   }
 
   /**
-   * Extract a single item from a row of cells
+   * Vérifie si une ligne de données est vide (tous les champs vides ou numériques sans sens)
    */
-  private extractItemFromRow(
-    cells: string[],
-    columns: DetectedColumn[]
-  ): PriceRequestItem | null {
-    const getValue = (type: ColumnType): string | undefined => {
-      const col = columns.find(c => c.type === type);
-      if (col && col.columnIndex !== undefined && col.columnIndex < cells.length) {
-        const val = cells[col.columnIndex];
-        return val ? String(val).trim() : undefined;
-      }
-      return undefined;
-    };
+  private isEmptyDataRow(cells: string[]): boolean {
+    const nonEmptyCells = cells.filter(c => c && String(c).trim().length > 0);
+    if (nonEmptyCells.length < 2) return true;
 
-    // Get description (required)
-    let description = getValue('description');
-    if (!description) {
-      // Try to find the longest text cell as description
-      let maxLen = 0;
-      for (const cell of cells) {
-        if (cell && String(cell).length > maxLen && !/^\d+([.,]\d+)?$/.test(String(cell))) {
-          maxLen = String(cell).length;
-          description = String(cell).trim();
-        }
+    // Vérifier s'il y a au moins une cellule avec du texte significatif
+    const hasText = cells.some(c => {
+      const s = String(c || '').trim();
+      return s.length >= 3 && !/^[\d\s\.\,\-\/]+$/.test(s);
+    });
+
+    return !hasText;
+  }
+
+  /**
+   * Extrait un item depuis des cellules
+   * Utilise TOUJOURS l'extraction heuristique car les PDF ont des colonnes mal alignées
+   */
+  private extractItemFromCells(cells: string[], columns: DetectedColumn[], rowIndex: number): PriceRequestItem | null {
+    // Pour les PDF, les colonnes détectées ne correspondent souvent pas aux indices des cellules
+    // On utilise donc une extraction heuristique qui analyse chaque cellule
+    return this.extractHeuristic(cells, rowIndex);
+  }
+
+  /**
+   * Extraction heuristique - analyse chaque cellule pour deviner son type
+   * C'est la méthode la plus robuste pour les PDF mal structurés
+   */
+  private extractHeuristic(cells: string[], rowIndex: number): PriceRequestItem | null {
+    if (cells.length < 1) return null;
+
+    // Si une seule cellule ou deux, essayer de re-splitter
+    let workingCells = cells;
+    if (cells.length <= 2) {
+      const combined = cells.join(' ').trim();
+      // Essayer de splitter avec différents patterns
+      const reSplit = this.smartSplitLine(combined);
+      if (reSplit.length > cells.length) {
+        workingCells = reSplit;
       }
     }
 
-    if (!description || description.length < 3) {
-      return null;
-    }
-
-    // Get quantity
+    let description: string | undefined;
     let quantity = 1;
-    const qtyStr = getValue('qty');
-    if (qtyStr) {
-      const parsed = parseFloat(qtyStr.replace(',', '.').replace(/[^\d.]/g, ''));
-      if (!isNaN(parsed) && parsed > 0 && parsed <= 100000) {
-        quantity = parsed;
-      }
-    }
+    let unit = 'pcs';
+    let reference: string | undefined;
+    let brand: string | undefined;
+    let internalCode: string | undefined;
 
-    // Build item
-    const item: PriceRequestItem = {
-      description,
-      quantity,
-      unit: getValue('uom') || 'pcs',
-    };
+    // Patterns pour identifier les types de données
+    const QTY_PATTERN = /^\d{1,4}([.,]\d+)?$/;  // Nombre 1-4 chiffres
+    const UNIT_PATTERNS = ['EA', 'PCS', 'PC', 'UNIT', 'SET', 'KG', 'M', 'L', 'BOX', 'EACH', 'PAIR', 'LOT', 'ROLL', 'LTR', 'MTR', 'OFF'];
+    const CODE_PATTERN = /^[A-Z0-9][\w\-\/\.]{2,}$/i;  // Code alphanumérique 3+ chars
+    const INTERNAL_CODE_PATTERN = /^\d{5,8}$/; // Code interne 5-8 chiffres (ex: 201368)
 
-    // Optional fields
-    const code = getValue('itemCode');
-    if (code) item.internalCode = code;
+    // Première passe: identifier qty, unit, codes internes et références
+    for (let i = 0; i < workingCells.length; i++) {
+      const cell = String(workingCells[i] || '').trim();
+      if (!cell) continue;
 
-    const partNumber = getValue('partNumber');
-    if (partNumber) {
-      item.supplierCode = partNumber;
-      item.reference = partNumber;
-    } else if (code) {
-      item.reference = code;
-    }
+      const cellUpper = cell.toUpperCase();
 
-    const brand = getValue('brand');
-    if (brand) item.brand = brand;
-
-    const lineNo = getValue('lineNo');
-    if (lineNo) {
-      const parsed = parseInt(lineNo, 10);
-      if (!isNaN(parsed)) item.originalLine = parsed;
-    }
-
-    const remark = getValue('remark');
-    if (remark) item.notes = remark;
-
-    const serial = getValue('serial');
-    if (serial) item.serialNumber = serial;
-
-    return item;
-  }
-
-  /**
-   * Parse a single text line as an item
-   */
-  private parseItemLine(
-    line: string,
-    header: HeaderDetection
-  ): PriceRequestItem | null {
-    // Skip obvious non-item lines
-    if (this.isMetadataLine(line)) return null;
-
-    // Try various patterns
-    const patterns = [
-      // Pattern: Line Qty UOM Code Description
-      /^(\d{1,3})\s+(\d+)\s+(EA|PCS|PC|KG|M|L|SET|UNIT|LOT)\s+(\d{5,8})\s+(.+)/i,
-      // Pattern: Qty x Description
-      /^(\d+)\s*[xX×]\s+(.{10,})/,
-      // Pattern: Code - Description - Qty
-      /^([A-Z0-9][\w\-]+)\s*[-–:]\s*(.{10,}?)\s*[-–:]\s*(\d+)/i,
-    ];
-
-    for (const pattern of patterns) {
-      const match = line.match(pattern);
-      if (match) {
-        return this.parsePatternMatch(match, pattern);
-      }
-    }
-
-    return null;
-  }
-
-  /**
-   * Parse a regex match into an item
-   */
-  private parsePatternMatch(
-    match: RegExpMatchArray,
-    pattern: RegExp
-  ): PriceRequestItem | null {
-    const source = pattern.source;
-
-    // Pattern: Line Qty UOM Code Description
-    if (source.includes('\\d{5,8}')) {
-      const qty = parseInt(match[2], 10);
-      if (qty <= 0 || qty > 100000) return null;
-
-      return {
-        originalLine: parseInt(match[1], 10),
-        quantity: qty,
-        unit: match[3].toLowerCase() === 'ea' ? 'pcs' : match[3].toLowerCase(),
-        internalCode: match[4],
-        reference: match[4],
-        description: match[5].trim(),
-      };
-    }
-
-    // Pattern: Qty x Description
-    if (source.includes('[xX×]')) {
-      const qty = parseInt(match[1], 10);
-      if (qty <= 0 || qty > 100000) return null;
-
-      return {
-        quantity: qty,
-        description: match[2].trim(),
-        unit: 'pcs',
-      };
-    }
-
-    // Pattern: Code - Description - Qty
-    if (source.includes('A-Z0-9')) {
-      return {
-        reference: match[1].trim(),
-        description: match[2].trim(),
-        quantity: parseInt(match[3], 10) || 1,
-        unit: 'pcs',
-      };
-    }
-
-    return null;
-  }
-
-  /**
-   * Post-process extracted items
-   * - Fusionne les lignes de continuation
-   * - Extrait brand et model
-   * - Déduplique
-   */
-  private postProcessItems(
-    items: PriceRequestItem[],
-    warnings: string[]
-  ): PriceRequestItem[] {
-    const processed: PriceRequestItem[] = [];
-    const seenKeys = new Set<string>();
-
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-
-      // Clean description
-      item.description = this.cleanDescription(item.description);
-
-      // Skip invalid items
-      if (!item.description || item.description.length < 3) {
-        continue;
-      }
-
-      // Merge continuation lines if enabled
-      if (this.config.mergeMultilineDescriptions && i < items.length - 1) {
-        const next = items[i + 1];
-        if (this.isContinuationLine(next, item)) {
-          // Fusionner description/spec/remark
-          item.description += ' ' + next.description;
-          if (next.notes) {
-            item.notes = item.notes ? `${item.notes} ${next.notes}` : next.notes;
-          }
-          items.splice(i + 1, 1);
-          i--; // Re-check current item
+      // Quantité (nombre seul, 1-4 chiffres)
+      if (QTY_PATTERN.test(cell) && quantity === 1) {
+        const num = parseFloat(cell.replace(',', '.'));
+        if (num > 0 && num <= 9999) {
+          quantity = num;
           continue;
         }
       }
 
-      // Deduplicate
-      const key = `${item.description.toLowerCase()}-${item.quantity}`;
-      if (seenKeys.has(key)) {
+      // Unité
+      if (UNIT_PATTERNS.includes(cellUpper) || /^(EA|PCS?|PC)$/i.test(cell)) {
+        unit = cellUpper;
         continue;
       }
-      seenKeys.add(key);
 
-      // Extract brand if not already set
+      // Code interne (5-8 chiffres, ex: 201368)
+      if (INTERNAL_CODE_PATTERN.test(cell) && !internalCode) {
+        // Vérifier que ce n'est pas un GL Code (commence par 1500)
+        if (!cell.startsWith('1500')) {
+          internalCode = cell;
+          continue;
+        }
+      }
+
+      // Code/Référence fournisseur (alphanumérique, 4-25 chars, pas que des chiffres)
+      if (CODE_PATTERN.test(cell) && cell.length >= 4 && cell.length <= 25) {
+        if (!/^\d+$/.test(cell) && !reference) {
+          reference = cell.toUpperCase();
+          continue;
+        }
+      }
+    }
+
+    // Deuxième passe: trouver la description (cellule la plus longue avec du texte)
+    let maxLen = 0;
+    for (const cell of workingCells) {
+      const s = String(cell || '').trim();
+      // Description: texte de 10+ chars, pas que des chiffres/symboles
+      if (s.length >= 10 && s.length > maxLen && !/^[\d\s\.\,\-\/\(\)\[\]]+$/.test(s)) {
+        if (!this.isNoiseLine(s)) {
+          // Vérifier que ce n'est pas juste un code
+          const words = s.split(/\s+/).filter(w => w.length >= 3);
+          if (words.length >= 1) {
+            maxLen = s.length;
+            description = s;
+          }
+        }
+      }
+    }
+
+    // Fallback: si pas de description longue, prendre la cellule la plus significative
+    if (!description) {
+      for (const cell of workingCells) {
+        const s = String(cell || '').trim();
+        if (s.length >= 5 && s.length > maxLen && !this.isNoiseLine(s)) {
+          if (!/^[\d\s\.\,\-\/]+$/.test(s) && !/^\d+$/.test(s)) {
+            maxLen = s.length;
+            description = s;
+          }
+        }
+      }
+    }
+
+    // Si toujours pas de description, essayer d'extraire depuis la ligne brute
+    if (!description && cells.length <= 2) {
+      const combined = cells.join(' ').trim();
+      const extracted = this.extractDescriptionFromLine(combined);
+      if (extracted) {
+        description = extracted.description;
+        if (!quantity || quantity === 1) quantity = extracted.quantity || 1;
+        if (!unit || unit === 'pcs') unit = extracted.unit || 'pcs';
+        if (!internalCode) internalCode = extracted.internalCode;
+        if (!reference) reference = extracted.reference;
+      }
+    }
+
+    // Pas de description = pas d'item
+    if (!description || description.length < 5) {
+      return null;
+    }
+
+    // Nettoyer la description des codes GL et prix
+    description = this.cleanItemDescription(description);
+
+    // Extraire la marque de la description
+    brand = this.extractBrand(description);
+
+    // Extraire le code de la description si pas trouvé dans les cellules
+    if (!reference) {
+      reference = this.extractSupplierCode(description);
+    }
+
+    return {
+      description: this.cleanDescription(description),
+      quantity,
+      unit,
+      reference: reference || internalCode,
+      internalCode,
+      supplierCode: reference,
+      brand,
+      originalLine: rowIndex,
+    };
+  }
+
+  /**
+   * Split intelligent d'une ligne en cellules
+   */
+  private smartSplitLine(line: string): string[] {
+    // Pattern 1: Format Purchase Requisition compact
+    // Ex: "10 10 EA 201368 RELAY OVERLOAD THERMAL..."
+    const prMatch = line.match(/^(\d{1,3})\s+(\d+)\s+(EA|PCS|PC|KG|M|L|SET|UNIT|LOT)\s+(\d{5,8})\s+(.+)/i);
+    if (prMatch) {
+      return [prMatch[1], prMatch[2], prMatch[3], prMatch[4], prMatch[5]];
+    }
+
+    // Pattern 2: Format sans code interne
+    // Ex: "10 3 EA Seat cover Hilux Dual Cab"
+    const simpleMatch = line.match(/^(\d{1,3})\s+(\d+)\s+(EA|PCS|PC|KG|M|L|SET|UNIT|LOT)\s+(.+)/i);
+    if (simpleMatch) {
+      return [simpleMatch[1], simpleMatch[2], simpleMatch[3], simpleMatch[4]];
+    }
+
+    // Pattern 3: Tab séparé
+    if (line.includes('\t')) {
+      return line.split('\t').map(c => c.trim()).filter(c => c);
+    }
+
+    // Pattern 4: Multiple espaces (3+)
+    const spaceSplit = line.split(/\s{3,}/);
+    if (spaceSplit.length >= 3) {
+      return spaceSplit.map(c => c.trim()).filter(c => c);
+    }
+
+    // Pattern 5: Détecter les colonnes par patterns de données
+    // Ex: "10" "EA" "201368" "DESCRIPTION..."
+    const parts = line.split(/\s+/);
+    if (parts.length >= 4) {
+      const result: string[] = [];
+      let descStart = -1;
+
+      for (let i = 0; i < parts.length; i++) {
+        const p = parts[i];
+        // Nombre 1-4 chiffres (qty/line)
+        if (/^\d{1,4}$/.test(p) && result.length < 2) {
+          result.push(p);
+          continue;
+        }
+        // Unité
+        if (/^(EA|PCS|PC|KG|M|L|SET|UNIT|LOT)$/i.test(p)) {
+          result.push(p);
+          continue;
+        }
+        // Code interne 5-8 chiffres
+        if (/^\d{5,8}$/.test(p) && !p.startsWith('1500')) {
+          result.push(p);
+          continue;
+        }
+        // Le reste est la description
+        if (descStart === -1 && /^[A-Z]/i.test(p)) {
+          descStart = i;
+          break;
+        }
+      }
+
+      if (descStart > 0) {
+        result.push(parts.slice(descStart).join(' '));
+        return result;
+      }
+    }
+
+    // Fallback: retourner le split original par 2+ espaces
+    return line.split(/\s{2,}/).map(c => c.trim()).filter(c => c);
+  }
+
+  /**
+   * Extraire description et données d'une ligne brute
+   */
+  private extractDescriptionFromLine(line: string): {
+    description?: string;
+    quantity?: number;
+    unit?: string;
+    internalCode?: string;
+    reference?: string;
+  } | null {
+    // Pattern Purchase Requisition complet avec GL Code
+    // Ex: "10 10 EA 201368 RELAY OVERLOAD THERMAL 17-25A CLASS 10A SCHNEIDER LRD325 1500405 0 0"
+    const prFullMatch = line.match(
+      /^\d{1,3}\s+(\d+)\s+(EA|PCS|PC|KG|M|L|SET|UNIT|LOT)\s+(\d{5,8})\s+([A-Z][A-Z0-9\s\-\.\/\&\,\(\)\:]+?)(?:\s+1500\d+|\s+\d+\s+\d+\s*(USD|EUR|XOF)?|\s*$)/i
+    );
+    if (prFullMatch) {
+      return {
+        quantity: parseInt(prFullMatch[1], 10),
+        unit: prFullMatch[2].toUpperCase(),
+        internalCode: prFullMatch[3],
+        description: prFullMatch[4].trim(),
+      };
+    }
+
+    // Pattern sans GL Code
+    const prSimpleMatch = line.match(
+      /^\d{1,3}\s+(\d+)\s+(EA|PCS|PC|KG|M|L|SET|UNIT|LOT)\s+(\d{5,8})\s+([A-Z].+)/i
+    );
+    if (prSimpleMatch) {
+      let desc = prSimpleMatch[4].trim();
+      // Nettoyer les codes GL à la fin
+      desc = desc.replace(/\s+1500\d+.*$/i, '').trim();
+      desc = desc.replace(/\s+\d+\s+\d+\s*(USD|EUR|XOF)?.*$/i, '').trim();
+      return {
+        quantity: parseInt(prSimpleMatch[1], 10),
+        unit: prSimpleMatch[2].toUpperCase(),
+        internalCode: prSimpleMatch[3],
+        description: desc,
+      };
+    }
+
+    // Pattern sans code interne
+    const simpleMatch = line.match(
+      /^\d{1,3}\s+(\d+)\s+(EA|PCS|PC|KG|M|L|SET|UNIT|LOT)\s+([A-Z].+)/i
+    );
+    if (simpleMatch) {
+      return {
+        quantity: parseInt(simpleMatch[1], 10),
+        unit: simpleMatch[2].toUpperCase(),
+        description: simpleMatch[3].trim(),
+      };
+    }
+
+    return null;
+  }
+
+  /**
+   * Nettoyer une description d'item (GL codes, prix, etc.)
+   */
+  private cleanItemDescription(desc: string): string {
+    let cleaned = desc;
+
+    // Supprimer les codes GL (1500xxx) collés ou avec espace
+    cleaned = cleaned.replace(/([A-Z]+\d+)1500\d+.*$/i, '$1').trim();
+    cleaned = cleaned.replace(/\s*1500\d+.*$/i, '').trim();
+
+    // Supprimer les prix et devises
+    cleaned = cleaned.replace(/\s+\d+\s+\d+\s*(USD|EUR|XOF)?.*$/i, '').trim();
+    cleaned = cleaned.replace(/\s+0\s+0\s*$/i, '').trim();
+
+    // Normaliser les espaces
+    cleaned = cleaned.replace(/\s{2,}/g, ' ').trim();
+
+    return cleaned;
+  }
+
+  /**
+   * Post-traitement des items
+   */
+  private postProcessItems(items: PriceRequestItem[]): PriceRequestItem[] {
+    const processed: PriceRequestItem[] = [];
+    const seen = new Set<string>();
+
+    for (const item of items) {
+      // Nettoyer la description
+      item.description = this.cleanDescription(item.description);
+
+      // Skip si description trop courte ou invalide
+      if (!item.description || item.description.length < 5) continue;
+      if (this.isNoiseLine(item.description)) continue;
+
+      // Extraire la marque si pas déjà définie
       if (!item.brand) {
         item.brand = this.extractBrand(item.description);
       }
 
-      // Extract model number from description (stocké dans notes pour l'instant)
-      const model = this.extractModel(item.description);
-      if (model && !item.notes?.includes(model)) {
-        item.notes = item.notes
-          ? `${item.notes} | Model: ${model}`
-          : `Model: ${model}`;
-      }
-
-      // Extract supplier code if not already set
+      // Extraire le code fournisseur si pas défini
       if (!item.supplierCode && !item.reference) {
-        item.supplierCode = this.extractSupplierCode(item.description);
-        if (item.supplierCode) {
-          item.reference = item.supplierCode;
+        const code = this.extractSupplierCode(item.description);
+        if (code) {
+          item.supplierCode = code;
+          item.reference = code;
         }
       }
+
+      // Déduplication par description + quantité
+      const descKey = item.description.toLowerCase().replace(/\s+/g, ' ').substring(0, 60);
+      const key = `${descKey}-${item.quantity}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
 
       processed.push(item);
     }
 
+    this.logger.debug(`Post-processed: ${items.length} -> ${processed.length} items`);
     return processed;
   }
 
   /**
-   * Check if a line is metadata (not an item)
+   * Vérifie si une ligne est du bruit (à ignorer)
    */
-  private isMetadataLine(line: string): boolean {
-    const metadataPatterns = [
-      /^(From|To|Cc|Bcc|Subject|Sent|Date|Re:|Fwd:|De:|À:|Objet:)\s*:/i,
-      /^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i,
-      /^(Lundi|Mardi|Mercredi|Jeudi|Vendredi|Samedi|Dimanche)/i,
-      /\b(Capital\s+social|RCCM|RC\s*:|NIF|SIRET|SIREN)\b/i,
-      /\bTEL\/FAX\s*:/i,
-      /^(Total|Grand Total|Sous-total|Subtotal)\b/i,
-      /^(Page\s+\d+|---+|\*\*\*+)$/i,
-    ];
+  private isNoiseLine(line: string): boolean {
+    const trimmed = line.trim();
 
-    return metadataPatterns.some(p => p.test(line));
-  }
+    if (trimmed.length < 3) return true;
 
-  /**
-   * Check if an item is a continuation of the previous line
-   * Amélioré avec plus de critères pour éviter les faux positifs
-   */
-  private isContinuationLine(item: PriceRequestItem, prevItem?: PriceRequestItem): boolean {
-    // Critères de base: pas de qty significative, pas de référence
-    const hasNoStructure = (
-      item.quantity === 1 &&
-      !item.reference &&
-      !item.internalCode &&
-      !item.supplierCode &&
-      item.description.length > 0
-    );
+    for (const pattern of NOISE_PATTERNS) {
+      if (pattern.test(trimmed)) return true;
+    }
 
-    if (!hasNoStructure) return false;
+    // Ligne qui ne contient que des chiffres/symboles
+    if (/^[\d\s\.\,\-\/\(\)\[\]]+$/.test(trimmed)) return true;
 
-    const desc = item.description;
+    // Labels qui se terminent par ":" (ex: "General Description:", "Purchase Requisitions No:")
+    if (/^[A-Za-z\s]+:\s*$/.test(trimmed)) return true;
 
-    // Pas de numéro de ligne au début
-    if (/^\d{1,3}\s/.test(desc)) return false;
+    // Labels avec valeur courte après ":" (ex: "Creation Date: 10-DEC-25")
+    if (/^[A-Za-z\s]+:\s*[\d\-\/A-Z]+$/i.test(trimmed) && trimmed.length < 40) return true;
 
-    // Pas de mot-clé qty/uom au début
-    if (/^(qty|quantity|qté|quantité|ea|pcs|pc|set|lot|kg|m|l)\b/i.test(desc)) return false;
-
-    // Si la description commence par une minuscule, c'est probablement une continuation
-    if (/^[a-z]/.test(desc)) return true;
-
-    // Si la description précédente se termine par un caractère de continuation
-    if (prevItem && /[,;:\-]$/.test(prevItem.description)) return true;
-
-    // Si la ligne est relativement courte (< 100 chars) et ne ressemble pas à un item
-    if (desc.length < 100) {
-      // Pas de pattern typique de nouvelle ligne item (code - desc, qty x desc)
-      if (!/^[A-Z0-9]{2,}[\s\-]/.test(desc) && !/^\d+\s*[xX×]/.test(desc)) {
+    // Noms de personnes (2-4 mots, chaque mot commence par majuscule)
+    const words = trimmed.split(/\s+/);
+    if (words.length >= 2 && words.length <= 4) {
+      const allCapitalized = words.every(w => /^[A-Z][a-zA-Z]*$/.test(w));
+      const hasNoNumbers = !/\d/.test(trimmed);
+      const shortWords = words.every(w => w.length <= 15);
+      if (allCapitalized && hasNoNumbers && shortWords && trimmed.length < 40) {
         return true;
       }
+    }
+
+    // Lignes qui ressemblent à des en-têtes de colonnes
+    const headerKeywords = ['line', 'qty', 'quantity', 'uom', 'item', 'code', 'description', 'stock', 'cost'];
+    const lowerTrimmed = trimmed.toLowerCase();
+    const matchedHeaders = headerKeywords.filter(h => lowerTrimmed.includes(h));
+    if (matchedHeaders.length >= 3 && trimmed.length < 60) {
+      return true;
+    }
+
+    // Descriptions trop courtes SAUF si c'est un nom de pièce valide (majuscules, pas de ponctuation finale)
+    const significantWords = words.filter(w => w.length >= 4 && !/^\d+$/.test(w));
+    if (significantWords.length < 2 && trimmed.length < 20) {
+      // Garder les noms de pièces courts en majuscules (ex: "MUFFLER", "CLAMP", "RELAY")
+      const isPartName = /^[A-Z][A-Z0-9\s\-\/]+$/.test(trimmed) && !trimmed.endsWith(':') && !trimmed.endsWith(',');
+      if (!isPartName) {
+        return true;
+      }
+    }
+
+    // Labels génériques qui ne sont pas des articles
+    const genericLabels = [
+      'delivery date', 'required date', 'creation date',
+      'new stock item', 'sole supplier', 'short motivation',
+      'additional description', 'general description',
+      'recommended supplier', 'preferred supplier',
+      'stock on hand', 'lead time', 'unit price',
+      // Shipping/logistics
+      'ship via', 'delivery loc', 'shipping method', 'freight',
+      // Legal/Company info
+      'régime', 'capital social', 'centre des', 'siège social',
+      "côte d'ivoire", "cote d'ivoire", 'reel normal', 'ivoire capital',
+      // Standards (sans description produit)
+      'applicable stand', 'iec ', 'iso ',
+      // Location codes
+      '-whse', 'warehouse',
+    ];
+    for (const label of genericLabels) {
+      if (lowerTrimmed.includes(label)) {
+        return true;
+      }
+    }
+
+    // Codes de localisation (ex: "ITY-WHSE")
+    if (/^[A-Z]{2,5}-WHSE$/i.test(trimmed)) {
+      return true;
+    }
+
+    // Codes seuls sans description (ex: "O770OP00M6006")
+    // Pattern: code alphanumérique AVEC des chiffres, sans espaces (pas un mot simple)
+    if (/^[A-Z0-9][\w\-\/\.]{5,20}$/.test(trimmed) && !trimmed.includes(' ') && /\d/.test(trimmed)) {
+      // C'est un code seul (contient des chiffres), pas une description
+      return true;
+    }
+
+    // Texte tronqué ou incomplet (se termine par des caractères partiels)
+    if (/[,\-&]\s*$/.test(trimmed) || trimmed.length < 5) {
+      return true;
     }
 
     return false;
   }
 
   /**
-   * Clean a description string
+   * Nettoie une description
    */
   private cleanDescription(desc: string): string {
+    if (!desc) return '';
     return desc
-      .replace(/\s+(USD|EUR|XOF)\s*/gi, ' ')
-      .replace(/\s+\d+\s+(USD|EUR|XOF)/gi, '')
-      .replace(/\s+1500\d+.*$/i, '')
-      .replace(/\s+0\s+0\s*$/i, '')
+      .replace(/\s+(USD|EUR|XOF|CFA)\s*/gi, ' ')
+      .replace(/\s+\d+[.,]\d+\s*(USD|EUR|XOF)/gi, '')
+      .replace(/\r\n/g, ' ')
       .replace(/\s{2,}/g, ' ')
       .trim();
   }
 
   /**
-   * Extract brand from description using dynamic brand list loaded from JSON
-   * Utilise une recherche par mot entier pour éviter les faux positifs
+   * Extrait la marque depuis la description
    */
   private extractBrand(description: string): string | undefined {
     const upper = description.toUpperCase();
 
-    // Ensure brands are loaded
     if (this.knownBrands.length === 0) {
       this.knownBrands = FALLBACK_BRANDS;
     }
 
-    // Sort brands by length (longest first) to match "SCHNEIDER ELECTRIC" before "SCHNEIDER"
     const sortedBrands = [...this.knownBrands].sort((a, b) => b.length - a.length);
 
     for (const brand of sortedBrands) {
-      // Regex pour mot entier (évite de matcher "CAT" dans "CATEGORY")
       const regex = new RegExp(`\\b${brand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
       if (regex.test(upper)) {
-        // Normaliser certaines variantes
         if (brand === 'CAT') return 'CATERPILLAR';
-        if (brand === 'BOSCH REXROTH') return 'REXROTH';
-        if (brand === 'SAUER DANFOSS') return 'DANFOSS';
         return brand;
       }
     }
@@ -904,43 +999,13 @@ export class TableParserService implements OnModuleInit {
   }
 
   /**
-   * Extract model number from description
-   * Patterns courants: WA470, LRD325, 6205-2RS, etc.
-   */
-  private extractModel(description: string): string | undefined {
-    const patterns = [
-      // Pattern: Lettres + chiffres (WA470, LRD325, PC200)
-      /\b([A-Z]{1,4}\d{2,5}[A-Z]?(?:-\d+)?)\b/i,
-      // Pattern: Chiffres + tiret + alphanum (6205-2RS, 22220-E1)
-      /\b(\d{4,6}[-/][A-Z0-9]{1,4})\b/i,
-      // Pattern: Série avec tiret (WA-470, PC-200)
-      /\b([A-Z]{2,3}-\d{2,4})\b/i,
-      // Pattern: Modèle avec slash (710/0321)
-      /\b(\d{3,4}\/\d{3,5})\b/,
-    ];
-
-    for (const pattern of patterns) {
-      const match = description.match(pattern);
-      if (match && match[1]) {
-        const model = match[1];
-        // Vérifier que ce n'est pas juste un numéro d'article
-        if (model.length >= 4 && !/^\d+$/.test(model)) {
-          return model.toUpperCase();
-        }
-      }
-    }
-    return undefined;
-  }
-
-  /**
-   * Extract supplier code from description
+   * Extrait le code fournisseur depuis la description
    */
   private extractSupplierCode(description: string): string | undefined {
     const patterns = [
       /\b([A-Z]{2,}[\-][A-Z0-9\-]+)\b/i,
-      /\b([A-Z]{2,}\d+[A-Z0-9]*\/[A-Z0-9]+)\b/i,
-      /\b(\d{3,}\s+\d{3,})\b/,
-      /\b([A-Z]{2,}\d{3,}[A-Z0-9\-]*)\b/i,
+      /\b(\d{3,}[\-\/][A-Z0-9]+)\b/i,
+      /\b([A-Z]{2,}\d{4,}[A-Z0-9]*)\b/i,
     ];
 
     for (const pattern of patterns) {
@@ -948,7 +1013,7 @@ export class TableParserService implements OnModuleInit {
       if (match && match[1].length >= 5) {
         const code = match[1];
         if (!/^(USD|EUR|PCS|UNIT|TOTAL)$/i.test(code)) {
-          return code;
+          return code.toUpperCase();
         }
       }
     }
@@ -956,62 +1021,44 @@ export class TableParserService implements OnModuleInit {
   }
 
   /**
-   * Split a row into cells using common delimiters
+   * Divise une ligne en cellules
    */
-  private splitRowIntoCells(row: string): string[] {
-    // Try tab first
-    if (row.includes('\t')) {
-      return row.split('\t').map(c => c.trim());
+  private splitIntoCells(line: string): string[] {
+    // Tab en premier
+    if (line.includes('\t')) {
+      return line.split('\t').map(c => c.trim()).filter(c => c);
     }
 
-    // Try semicolon
-    if (row.includes(';')) {
-      return row.split(';').map(c => c.trim());
+    // Point-virgule
+    if (line.includes(';')) {
+      return line.split(';').map(c => c.trim()).filter(c => c);
     }
 
-    // Try multiple spaces (3+)
-    const spaceSplit = row.split(/\s{3,}/);
-    if (spaceSplit.length > 2) {
-      return spaceSplit.map(c => c.trim());
+    // Pipe
+    if (line.includes('|')) {
+      return line.split('|').map(c => c.trim()).filter(c => c);
     }
 
-    // Return as single cell
-    return [row.trim()];
+    // Espaces multiples (2+) - plus permissif
+    const spaceSplit = line.split(/\s{2,}/);
+    if (spaceSplit.length >= 2) {
+      return spaceSplit.map(c => c.trim()).filter(c => c);
+    }
+
+    // Retourner la ligne entière
+    return [line.trim()];
   }
 
   /**
-   * Normalize text for comparison
+   * Normalise le texte pour comparaison
    */
   private normalizeText(text: string): string {
     return text
       .toLowerCase()
       .normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '') // Remove accents
-      .replace(/[^a-z0-9\s]/g, '')     // Remove punctuation
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-z0-9\s]/g, '')
       .replace(/\s+/g, ' ')
       .trim();
-  }
-
-  /**
-   * Simple fuzzy match using Levenshtein-like comparison
-   */
-  private fuzzyMatch(a: string, b: string): number {
-    if (a === b) return 1.0;
-    if (a.length === 0 || b.length === 0) return 0.0;
-
-    // Check if one contains the other
-    if (a.includes(b) || b.includes(a)) {
-      const longer = Math.max(a.length, b.length);
-      const shorter = Math.min(a.length, b.length);
-      return shorter / longer;
-    }
-
-    // Simple character-based similarity
-    const aSet = new Set(a.split(''));
-    const bSet = new Set(b.split(''));
-    const intersection = new Set([...aSet].filter(c => bSet.has(c)));
-    const union = new Set([...aSet, ...bSet]);
-
-    return intersection.size / union.size;
   }
 }

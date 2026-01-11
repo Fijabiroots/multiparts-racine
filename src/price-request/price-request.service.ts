@@ -85,8 +85,18 @@ export class PriceRequestService {
           // Patterns connus: outlook-xxx.png, image001.png, cid:xxx, etc.
           // =====================================================
 
-          // Pattern 1: Images Outlook explicites (outlook-xxx.png, Outlook_xxx.jpg)
-          if (/^outlook[-_]/i.test(lowerName)) {
+          // Pattern 1: Images contenant "outlook" n'importe où dans le nom
+          if (/outlook/i.test(lowerName)) {
+            return false;
+          }
+
+          // Pattern 1b: Images contenant "logo" (souvent signatures d'entreprise)
+          if (/logo/i.test(lowerName) && lowerType.includes('image')) {
+            return false;
+          }
+
+          // Pattern 1c: Fichiers se terminant par "Desc.png/jpg" (ex: LogoDesc.png)
+          if (/desc\.(png|jpg|jpeg|gif)$/i.test(lowerName)) {
             return false;
           }
 

@@ -192,6 +192,46 @@ export class PdfService {
     return { line: parseInt(combined.slice(0, 2), 10), qty: parseInt(combined.slice(2), 10) || 1 };
   }
 
+  /**
+   * Vérifie si une ligne contient des métadonnées d'email à ignorer
+   */
+  private isEmailMetadata(text: string): boolean {
+    const emailPatterns = [
+      /^(From|To|Cc|Bcc|Subject|Sent|Date|Re:|Fwd:|De:|À:|Objet:)\s*:/i,
+      /^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+\w+\s+\d{1,2},?\s+\d{4}/i,
+      /^(Lundi|Mardi|Mercredi|Jeudi|Vendredi|Samedi|Dimanche),?\s+\d{1,2}\s+\w+\s+\d{4}/i,
+      /^\s*(From|Sent|Subject|To|Cc)\s+/i,
+      /\d{1,2}:\d{2}\s*(AM|PM)?\s*$/i, // Heures d'envoi
+    ];
+    return emailPatterns.some(p => p.test(text));
+  }
+
+  /**
+   * Vérifie si une ligne contient des informations légales d'entreprise à ignorer
+   */
+  private isCompanyHeader(text: string): boolean {
+    const companyPatterns = [
+      /\b(Capital\s+social|RCCM|RC\s*:|NIF|SIRET|SIREN)\b/i,
+      /\b(Bon\s+de\s+commande|Purchase\s+Order)\b.*\b(Num[eé]ro|Number|No\.?)\b/i,
+      /\bTEL\/FAX\s*:/i,
+      /\bBP\s+\d+\s+Abidjan/i,
+      /\bC[oô]te\s+d['']?Ivoire\b/i,
+      /\bSoci[eé]t[eé]\s+de\s+Mines/i,
+      /\bEndeavour\s+Mining\b.*\b(Si[eè]ge|rue|ancien)\b/i,
+      /^\s*CIV\s*$/i, // Code pays seul
+    ];
+    return companyPatterns.some(p => p.test(text));
+  }
+
+  /**
+   * Vérifie si une quantité est valide (pas un numéro de commande/référence)
+   */
+  private isValidQuantity(qty: number): boolean {
+    // Les quantités > 100000 sont probablement des numéros de commande
+    // Les quantités typiques sont entre 1 et 10000
+    return qty > 0 && qty <= 100000;
+  }
+
   private extractPurchaseRequisitionItems(text: string): PriceRequestItem[] {
     const items: PriceRequestItem[] = [];
 
@@ -257,6 +297,18 @@ export class PdfService {
       // Nettoyer la description
       description = this.cleanDescription(description);
 
+      // FILTRE: Ignorer les métadonnées d'email et en-têtes d'entreprise
+      if (this.isEmailMetadata(description) || this.isCompanyHeader(description)) {
+        this.logger.debug(`Item ignoré (metadata/header): "${description.substring(0, 50)}..."`);
+        continue;
+      }
+
+      // FILTRE: Vérifier que la quantité est valide
+      if (!this.isValidQuantity(qty)) {
+        this.logger.debug(`Item ignoré (qty invalide ${qty}): "${description.substring(0, 50)}..."`);
+        continue;
+      }
+
       if (description.length > 5 && qty > 0 && !foundItems.has(itemCode)) {
         foundItems.set(itemCode, { qty, unit, desc: description, lineNum: '0' });
         this.logger.debug(`Item ultra-compact: Code=${itemCode}, Qty=${qty}, Unit=${unit}, GL=${glCode}, Desc="${description.substring(0, 50)}..."`);
@@ -286,6 +338,16 @@ export class PdfService {
 
         description = this.cleanDescription(description);
 
+        // FILTRE: Ignorer les métadonnées d'email et en-têtes d'entreprise
+        if (this.isEmailMetadata(description) || this.isCompanyHeader(description)) {
+          continue;
+        }
+
+        // FILTRE: Vérifier que la quantité est valide
+        if (!this.isValidQuantity(qty)) {
+          continue;
+        }
+
         if (description.length > 5 && qty > 0 && !foundItems.has(itemCode)) {
           foundItems.set(itemCode, { qty, unit, desc: description, lineNum: '0' });
           this.logger.debug(`Item compact: Code=${itemCode}, Qty=${qty}, Unit=${unit}, Desc="${description.substring(0, 50)}..."`);
@@ -314,6 +376,16 @@ export class PdfService {
         let description = match[5].trim();
 
         description = this.cleanDescription(description);
+
+        // FILTRE: Ignorer les métadonnées d'email et en-têtes d'entreprise
+        if (this.isEmailMetadata(description) || this.isCompanyHeader(description)) {
+          continue;
+        }
+
+        // FILTRE: Vérifier que la quantité est valide
+        if (!this.isValidQuantity(qty)) {
+          continue;
+        }
 
         if (description.length > 5 && !foundItems.has(itemCode)) {
           foundItems.set(itemCode, { qty, unit, desc: description, lineNum });
@@ -488,6 +560,11 @@ export class PdfService {
             // Nettoyer la description
             description = this.cleanDescription(description);
 
+            // FILTRE: Ignorer les métadonnées d'email et en-têtes d'entreprise
+            if (this.isEmailMetadata(description) || this.isCompanyHeader(description)) {
+              continue;
+            }
+
             const itemKey = `LINE-${lineNum}`;
 
             if (!foundItems.has(itemKey) && description.length > 5) {
@@ -532,6 +609,16 @@ export class PdfService {
           description = description.replace(/\s+1500\d+.*$/i, '').trim();
           description = description.replace(/\s+\d+\s+(USD|EUR|XOF).*$/i, '').trim();
 
+          // FILTRE: Ignorer les métadonnées d'email et en-têtes d'entreprise
+          if (this.isEmailMetadata(description) || this.isCompanyHeader(description)) {
+            continue;
+          }
+
+          // FILTRE: Vérifier que la quantité est valide
+          if (!this.isValidQuantity(qty)) {
+            continue;
+          }
+
           if (description.length > 5 && !items.some(i => i.internalCode === itemCode)) {
             const supplierCode = this.extractSupplierCodeFromDescription(description);
             const brand = detectedBrand || this.extractBrandFromDescription(description);
@@ -559,6 +646,16 @@ export class PdfService {
 
           // Nettoyer
           description = this.cleanDescription(description);
+
+          // FILTRE: Ignorer les métadonnées d'email et en-têtes d'entreprise
+          if (this.isEmailMetadata(description) || this.isCompanyHeader(description)) {
+            continue;
+          }
+
+          // FILTRE: Vérifier que la quantité est valide
+          if (!this.isValidQuantity(qty)) {
+            continue;
+          }
 
           const itemKey = `LINE-${lineNum}`;
           if (description.length > 5 && !items.some(i => i.reference === itemKey)) {
