@@ -69,19 +69,47 @@ export class DraftService {
   }
 
   async saveToDrafts(options: DraftEmailOptions): Promise<{ success: boolean; messageId?: string; error?: string }> {
-    const connection = await imapSimple.connect(this.getImapConfig());
     const draftsFolder = this.configService.get<string>('drafts.folder') || 'Drafts';
+    return this.saveToFolder(options, draftsFolder, ['\\Draft', '\\Seen']);
+  }
+
+  /**
+   * Sauvegarder un email dans un dossier IMAP spécifique
+   * @param options Options de l'email
+   * @param folder Nom du dossier IMAP (ex: 'Notifications RFQ', 'Drafts')
+   * @param flags Flags IMAP à appliquer (ex: ['\\Seen'], ['\\Draft', '\\Seen'])
+   */
+  async saveToFolder(
+    options: DraftEmailOptions,
+    folder: string,
+    flags: string[] = ['\\Seen'],
+  ): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const connection = await imapSimple.connect(this.getImapConfig());
 
     try {
       const mimeMessage = await this.createMimeMessage(options);
-      await connection.openBox(draftsFolder);
+
+      // Essayer d'ouvrir le dossier, le créer s'il n'existe pas
+      try {
+        await connection.openBox(folder);
+      } catch (err) {
+        // Créer le dossier s'il n'existe pas
+        this.logger.log(`Création du dossier IMAP: ${folder}`);
+        await new Promise<void>((resolve, reject) => {
+          (connection as any).imap.addBox(folder, (error: Error | null) => {
+            if (error) reject(error);
+            else resolve();
+          });
+        });
+        await connection.openBox(folder);
+      }
 
       await new Promise<void>((resolve, reject) => {
         (connection as any).imap.append(
           mimeMessage,
           {
-            mailbox: draftsFolder,
-            flags: ['\\Draft', '\\Seen'],
+            mailbox: folder,
+            flags,
           },
           (err: Error | null) => {
             if (err) reject(err);
@@ -90,14 +118,168 @@ export class DraftService {
         );
       });
 
-      this.logger.log(`📝 Brouillon sauvegardé dans ${draftsFolder}: ${options.subject}`);
+      this.logger.log(`📝 Email sauvegardé dans ${folder}: ${options.subject}`);
       return { success: true };
     } catch (error) {
-      this.logger.error(`Erreur sauvegarde brouillon: ${error.message}`);
+      this.logger.error(`Erreur sauvegarde dans ${folder}: ${error.message}`);
       return { success: false, error: error.message };
     } finally {
       connection.end();
     }
+  }
+
+  /**
+   * Envoyer une notification RFQ à rafiou.oyeossi@ dans le dossier "Notifications RFQ"
+   * Utilisé quand un email arrive uniquement sur procurement@
+   */
+  async sendRfqNotification(options: {
+    originalEmail: {
+      from: string;
+      subject: string;
+      date: Date;
+      body: string;
+      attachments?: Array<{ filename: string; content: Buffer; contentType?: string }>;
+    };
+    clientName?: string;
+    clientEmail: string;
+    clientRequirements?: {
+      responseDeadline?: string;
+      replyToEmail?: string;
+      urgent?: boolean;
+    };
+  }): Promise<{ success: boolean; error?: string }> {
+    const notificationFolder = 'Notifications RFQ';
+
+    // Générer le corps de la notification
+    const { htmlBody, textBody } = this.generateNotificationContent(options);
+
+    // Inclure l'email original et ses pièces jointes
+    const attachments: Array<{ filename: string; content: Buffer; contentType?: string }> = [];
+
+    // Ajouter les pièces jointes originales
+    if (options.originalEmail.attachments) {
+      for (const att of options.originalEmail.attachments) {
+        attachments.push(att);
+      }
+    }
+
+    return this.saveToFolder(
+      {
+        to: 'rafiou.oyeossi@multipartsci.com',
+        subject: `[NOTIFICATION RFQ] ${options.originalEmail.subject}`,
+        body: textBody,
+        htmlBody,
+        attachments,
+      },
+      notificationFolder,
+      ['\\Seen'],
+    );
+  }
+
+  /**
+   * Générer le contenu de la notification RFQ
+   */
+  private generateNotificationContent(options: {
+    originalEmail: {
+      from: string;
+      subject: string;
+      date: Date;
+      body: string;
+    };
+    clientName?: string;
+    clientEmail: string;
+    clientRequirements?: {
+      responseDeadline?: string;
+      replyToEmail?: string;
+      urgent?: boolean;
+    };
+  }): { htmlBody: string; textBody: string } {
+    const { originalEmail, clientName, clientEmail, clientRequirements } = options;
+    const hasRequirements = clientRequirements && (clientRequirements.responseDeadline || clientRequirements.replyToEmail);
+
+    const htmlBody = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body { font-family: Arial, sans-serif; font-size: 14px; line-height: 1.6; color: #333; }
+    .alert { color: #c0392b; font-weight: bold; }
+    .info-box { background: #f8f9fa; border-left: 4px solid #3498db; padding: 15px; margin: 15px 0; }
+    .requirements-box { background: #fef9e7; border-left: 4px solid #e74c3c; padding: 15px; margin: 15px 0; }
+    .original-email { background: #ecf0f1; padding: 15px; margin: 20px 0; border-radius: 5px; }
+  </style>
+</head>
+<body>
+
+<h2>📬 Nouvelle demande reçue sur procurement@</h2>
+
+<p>Une nouvelle demande de prix a été reçue <strong>uniquement</strong> sur l'adresse procurement@multipartsci.com.</p>
+
+<div class="info-box">
+  <h3>📋 Informations Client</h3>
+  <table>
+    <tr><td><strong>De:</strong></td><td>${originalEmail.from}</td></tr>
+    <tr><td><strong>Client:</strong></td><td>${clientName || 'Non identifié'}</td></tr>
+    <tr><td><strong>Email:</strong></td><td>${clientEmail}</td></tr>
+    <tr><td><strong>Date:</strong></td><td>${originalEmail.date.toLocaleDateString('fr-FR')} ${originalEmail.date.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}</td></tr>
+    <tr><td><strong>Sujet:</strong></td><td>${originalEmail.subject}</td></tr>
+  </table>
+</div>
+
+${hasRequirements ? `
+<div class="requirements-box">
+  <h3 class="alert">⚠️ EXIGENCES CLIENT</h3>
+  <table>
+    ${clientRequirements?.responseDeadline ? `<tr><td><strong class="alert">Délai de réponse exigé:</strong></td><td class="alert">${clientRequirements.responseDeadline}</td></tr>` : ''}
+    ${clientRequirements?.replyToEmail ? `<tr><td><strong class="alert">Adresse de réponse:</strong></td><td class="alert">${clientRequirements.replyToEmail}</td></tr>` : ''}
+    ${clientRequirements?.urgent ? `<tr><td colspan="2" class="alert">⚡ DEMANDE URGENTE</td></tr>` : ''}
+  </table>
+</div>
+` : ''}
+
+<div class="original-email">
+  <h3>📧 Message original</h3>
+  <pre style="white-space: pre-wrap; font-family: inherit;">${originalEmail.body.substring(0, 2000)}${originalEmail.body.length > 2000 ? '\n\n[...tronqué...]' : ''}</pre>
+</div>
+
+<p style="font-size: 12px; color: #666; margin-top: 30px;">
+  Les pièces jointes originales sont incluses avec cette notification.<br>
+  <em>Notification générée automatiquement par le système RFQ.</em>
+</p>
+
+</body>
+</html>`;
+
+    const textBody = `NOTIFICATION RFQ - Nouvelle demande sur procurement@
+========================================================
+
+Une nouvelle demande de prix a été reçue UNIQUEMENT sur procurement@multipartsci.com.
+
+INFORMATIONS CLIENT
+-------------------
+De: ${originalEmail.from}
+Client: ${clientName || 'Non identifié'}
+Email: ${clientEmail}
+Date: ${originalEmail.date.toLocaleDateString('fr-FR')} ${originalEmail.date.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}
+Sujet: ${originalEmail.subject}
+
+${hasRequirements ? `
+⚠️ EXIGENCES CLIENT ⚠️
+----------------------
+${clientRequirements?.responseDeadline ? `Délai de réponse exigé: ${clientRequirements.responseDeadline}` : ''}
+${clientRequirements?.replyToEmail ? `Adresse de réponse: ${clientRequirements.replyToEmail}` : ''}
+${clientRequirements?.urgent ? `⚡ DEMANDE URGENTE` : ''}
+` : ''}
+
+MESSAGE ORIGINAL
+----------------
+${originalEmail.body.substring(0, 2000)}${originalEmail.body.length > 2000 ? '\n\n[...tronqué...]' : ''}
+
+---
+Les pièces jointes originales sont incluses avec cette notification.
+Notification générée automatiquement par le système RFQ.`;
+
+    return { htmlBody, textBody };
   }
 
   private async createMimeMessage(options: DraftEmailOptions): Promise<string> {
@@ -207,15 +389,9 @@ export class DraftService {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // DÉTERMINER LA LANGUE
+    // FORCER LE MODE BILINGUE (Français ET Anglais toujours)
     // ═══════════════════════════════════════════════════════════════════════
-    let language: RfqLanguage = options.language || 'both';
-    if (options.autoDetectLanguage && !options.language) {
-      language = detectLanguageFromEmail(to);
-      if (language === 'both' && priceRequest.notes) {
-        language = detectLanguageFromText(priceRequest.notes);
-      }
-    }
+    const language: RfqLanguage = 'both'; // Toujours bilingue
 
     // ═══════════════════════════════════════════════════════════════════════
     // GÉNÉRER LE CONTENU
@@ -274,38 +450,56 @@ export class DraftService {
     const c = COMPANY_INFO.contact;
     const addr = COMPANY_INFO.address;
 
-    // Salutation selon la langue
-    const greeting = language === 'en' 
-      ? 'Dear Sir or Madam,' 
-      : language === 'fr' 
-        ? 'Bonjour,' 
-        : 'Bonjour / Dear Sir or Madam,';
-
-    // Introduction
-    const intro = language === 'en'
-      ? 'Please find attached a new Request for Quotation.'
-      : language === 'fr'
-        ? 'Veuillez trouver ci-joint une nouvelle demande de prix.'
-        : 'Veuillez trouver ci-joint une nouvelle demande de prix. / Please find attached a new Request for Quotation.';
+    // Toujours bilingue maintenant
+    const greeting = 'Bonjour / Dear Sir or Madam,';
+    const intro = 'Veuillez trouver ci-joint une nouvelle demande de prix. / Please find attached a new Request for Quotation.';
 
     // Informations client
     const clientInfoRows = [
-      priceRequest.clientName ? `<tr><td><strong>${language === 'en' ? 'Client' : 'Client'}:</strong></td><td>${priceRequest.clientName}</td></tr>` : '',
-      priceRequest.clientRfqNumber ? `<tr><td><strong>${language === 'en' ? 'Client Ref.' : 'Réf. Client'}:</strong></td><td>${priceRequest.clientRfqNumber}</td></tr>` : '',
-      priceRequest.clientEmail ? `<tr><td><strong>${language === 'en' ? 'Client Contact' : 'Contact Client'}:</strong></td><td>${priceRequest.clientEmail}</td></tr>` : '',
+      priceRequest.clientName ? `<tr><td><strong>Client:</strong></td><td>${priceRequest.clientName}</td></tr>` : '',
+      priceRequest.clientRfqNumber ? `<tr><td><strong>Réf. Client / Client Ref.:</strong></td><td>${priceRequest.clientRfqNumber}</td></tr>` : '',
+      priceRequest.clientEmail ? `<tr><td><strong>Contact Client / Client Contact:</strong></td><td>${priceRequest.clientEmail}</td></tr>` : '',
       priceRequest.fleetNumber ? `<tr><td><strong>Fleet Number:</strong></td><td>${priceRequest.fleetNumber}</td></tr>` : '',
       priceRequest.serialNumber ? `<tr><td><strong>Serial Number:</strong></td><td>${priceRequest.serialNumber}</td></tr>` : '',
     ].filter(x => x).join('');
 
-    // Section marques détectées (visible uniquement en interne, pas envoyé aux fournisseurs)
+    // Section marques détectées
     let brandsSection = '';
     if (brandAnalysis && brandAnalysis.detectedBrands.length > 0) {
-      const brandsLabel = language === 'en' ? 'Brands' : 'Marques';
       brandsSection = `
     <tr>
-      <td><strong>${brandsLabel}:</strong></td>
+      <td><strong>Marques / Brands:</strong></td>
       <td>${brandAnalysis.detectedBrands.join(', ')}</td>
     </tr>`;
+    }
+
+    // Section exigences client (EN ROUGE si présentes)
+    let clientRequirementsSection = '';
+    if (priceRequest.clientRequirements) {
+      const reqs = priceRequest.clientRequirements;
+      const hasRequirements = reqs.responseDeadline || reqs.replyToEmail || reqs.urgent;
+
+      if (hasRequirements) {
+        clientRequirementsSection = `
+<div style="background: #fef2f2; border-left: 4px solid #e74c3c; padding: 15px; margin: 15px 0;">
+  <h3 style="color: #c0392b; margin-top: 0;">⚠️ EXIGENCES CLIENT / CLIENT REQUIREMENTS</h3>
+  <table class="info-table">
+    ${reqs.urgent ? `<tr><td colspan="2" style="color: #c0392b; font-weight: bold; font-size: 16px;">⚡ DEMANDE URGENTE / URGENT REQUEST</td></tr>` : ''}
+    ${reqs.responseDeadline ? `<tr>
+      <td style="color: #c0392b; font-weight: bold;">Délai de réponse exigé / Required Response Time:</td>
+      <td style="color: #c0392b; font-weight: bold; font-size: 16px;">${reqs.responseDeadline}</td>
+    </tr>` : ''}
+    ${reqs.replyToEmail ? `<tr>
+      <td style="color: #c0392b; font-weight: bold;">Adresse de réponse / Reply To:</td>
+      <td style="color: #c0392b; font-weight: bold;">${reqs.replyToEmail}</td>
+    </tr>` : ''}
+    ${reqs.otherRequirements?.length ? `<tr>
+      <td style="color: #c0392b; font-weight: bold;">Autres exigences / Other Requirements:</td>
+      <td style="color: #c0392b;">${reqs.otherRequirements.join(', ')}</td>
+    </tr>` : ''}
+  </table>
+</div>`;
+      }
     }
 
     return `<!DOCTYPE html>
@@ -332,25 +526,33 @@ ${getCompanyHeader()}
 <p>${greeting}</p>
 <p>${intro}</p>
 
+<!-- EXIGENCES CLIENT (en rouge si présentes) -->
+${clientRequirementsSection}
+
 <!-- INFORMATIONS DEMANDE -->
 <div class="info-box">
-  <h3>📋 ${language === 'en' ? 'Request Information' : language === 'fr' ? 'Informations Demande' : 'Informations Demande / Request Information'}</h3>
+  <h3>📋 Informations Demande / Request Information</h3>
   <table class="info-table">
     <tr>
-      <td><strong>${language === 'en' ? 'Internal Ref.' : 'N° Demande'}:</strong></td>
+      <td><strong>N° Demande / Internal Ref.:</strong></td>
       <td>${priceRequest.requestNumber}</td>
     </tr>
     <tr>
       <td><strong>Date:</strong></td>
       <td>${priceRequest.date.toLocaleDateString('fr-FR')}</td>
     </tr>
+    ${priceRequest.sourceEmail?.date ? `
     <tr>
-      <td><strong>${language === 'en' ? 'Number of items' : 'Nombre d\'articles'}:</strong></td>
+      <td><strong>Réception demande client / Client Request Received:</strong></td>
+      <td>${new Date(priceRequest.sourceEmail.date).toLocaleDateString('fr-FR')} ${new Date(priceRequest.sourceEmail.date).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}</td>
+    </tr>` : ''}
+    <tr>
+      <td><strong>Nombre d'articles / Number of items:</strong></td>
       <td>${priceRequest.items.length}</td>
     </tr>
     <tr>
-      <td><strong>${language === 'en' ? 'Response deadline' : 'Délai de réponse'}:</strong></td>
-      <td>${responseHours}h (${language === 'en' ? 'before' : 'avant le'} ${deadlineDate.toLocaleDateString('fr-FR')} ${deadlineDate.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })})</td>
+      <td><strong>Délai de réponse / Response deadline:</strong></td>
+      <td>${responseHours}h (avant le / before ${deadlineDate.toLocaleDateString('fr-FR')} ${deadlineDate.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })})</td>
     </tr>
     ${clientInfoRows}
   </table>
@@ -405,7 +607,7 @@ ${priceRequest.notes ? `
   }
 
   /**
-   * Version texte brut pour compatibilité
+   * Version texte brut pour compatibilité - toujours bilingue
    */
   private generateTextEmailBody(priceRequest: any, language: RfqLanguage): string {
     const responseHours = priceRequest.responseDeadlineHours || 24;
@@ -417,138 +619,84 @@ ${priceRequest.notes ? `
 
     const clientInfo = [
       priceRequest.clientName ? `Client: ${priceRequest.clientName}` : '',
-      priceRequest.clientRfqNumber ? `Réf. Client: ${priceRequest.clientRfqNumber}` : '',
-      priceRequest.clientEmail ? `Contact Client: ${priceRequest.clientEmail}` : '',
+      priceRequest.clientRfqNumber ? `Réf. Client / Client Ref.: ${priceRequest.clientRfqNumber}` : '',
+      priceRequest.clientEmail ? `Contact Client / Client Contact: ${priceRequest.clientEmail}` : '',
       priceRequest.fleetNumber ? `Fleet Number: ${priceRequest.fleetNumber}` : '',
       priceRequest.serialNumber ? `Serial Number: ${priceRequest.serialNumber}` : '',
     ].filter(x => x).join('\n');
 
-    let body = '';
+    // Section exigences client (si présentes)
+    let clientRequirementsSection = '';
+    if (priceRequest.clientRequirements) {
+      const reqs = priceRequest.clientRequirements;
+      const hasReqs = reqs.responseDeadline || reqs.replyToEmail || reqs.urgent;
 
-    if (language === 'fr' || language === 'both') {
-      body += `═══════════════════════════════════════════════════════
-MULTIPARTS CI - DEMANDE DE PRIX
+      if (hasReqs) {
+        const parts: string[] = [];
+        if (reqs.urgent) parts.push('⚡ DEMANDE URGENTE / URGENT REQUEST');
+        if (reqs.responseDeadline) parts.push(`Délai de réponse exigé / Required Response Time: ${reqs.responseDeadline}`);
+        if (reqs.replyToEmail) parts.push(`Adresse de réponse / Reply To: ${reqs.replyToEmail}`);
+        if (reqs.otherRequirements?.length) parts.push(`Autres exigences / Other: ${reqs.otherRequirements.join(', ')}`);
+
+        clientRequirementsSection = `
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+⚠️ EXIGENCES CLIENT / CLIENT REQUIREMENTS ⚠️
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+${parts.join('\n')}
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+`;
+      }
+    }
+
+    // Toujours bilingue (Français ET Anglais)
+    const body = `═══════════════════════════════════════════════════════
+MULTIPARTS CI - DEMANDE DE PRIX / PRICE REQUEST
 ═══════════════════════════════════════════════════════
 
-Bonjour,
+Bonjour / Dear Sir or Madam,
 
 Veuillez trouver ci-joint une nouvelle demande de prix.
-
-INFORMATIONS DEMANDE
---------------------
-N° Demande: ${priceRequest.requestNumber}
-Date: ${priceRequest.date.toLocaleDateString('fr-FR')}
-Nombre d'articles: ${priceRequest.items.length}
-Délai de réponse: ${responseHours}h (avant le ${deadlineDate.toLocaleDateString('fr-FR')})
-
-${clientInfo ? `INFORMATIONS CLIENT\n--------------------\n${clientInfo}\n` : ''}
-
-INSTRUCTIONS RFQ - MULTIPARTS
-=============================
-Merci de nous transmettre votre offre avec:
-
-1) PRIX
-   - Prix unitaire pour chaque article
-   - Prix total de l'offre
-   - Devise (EUR / USD / autre)
-
-2) INCOTERM
-   - Ex-Works (EXW) ou CIF Abidjan
-   - Lieu EXW exact (ville, pays)
-
-3) LOGISTIQUE
-   - Poids total (kg)
-   - Dimensions et nombre de colis
-
-4) TECHNIQUE
-   - Fiche technique / plans
-   - Références constructeur exactes
-   - Normes et certifications
-
-5) DÉLAIS
-   - Délai de livraison
-   - Validité de l'offre
-
-6) CONDITIONS COMMERCIALES
-   - Conditions de paiement
-   - Origine des produits (pays)
-
-ADRESSE DE LIVRAISON
---------------------
-${COMPANY_INFO.name}
-${addr.line1}
-${addr.line2}
-${addr.city}, ${addr.country}
-
-`;
-    }
-
-    if (language === 'both') {
-      body += `
-═══════════════════════════════════════════════════════
-ENGLISH VERSION BELOW
-═══════════════════════════════════════════════════════
-
-`;
-    }
-
-    if (language === 'en' || language === 'both') {
-      body += `═══════════════════════════════════════════════════════
-MULTIPARTS CI - REQUEST FOR QUOTATION
-═══════════════════════════════════════════════════════
-
-Dear Sir or Madam,
-
 Please find attached a new Request for Quotation.
 
-REQUEST INFORMATION
--------------------
-Reference: ${priceRequest.requestNumber}
-Date: ${priceRequest.date.toLocaleDateString('en-GB')}
-Number of items: ${priceRequest.items.length}
-Response deadline: ${responseHours}h (before ${deadlineDate.toLocaleDateString('en-GB')})
+${clientRequirementsSection}INFORMATIONS DEMANDE / REQUEST INFORMATION
+-------------------------------------------
+N° Demande / Internal Ref.: ${priceRequest.requestNumber}
+Date: ${priceRequest.date.toLocaleDateString('fr-FR')}
+${priceRequest.sourceEmail?.date ? `Réception demande client / Client Request Received: ${new Date(priceRequest.sourceEmail.date).toLocaleDateString('fr-FR')} ${new Date(priceRequest.sourceEmail.date).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}\n` : ''}Nombre d'articles / Number of items: ${priceRequest.items.length}
+Délai de réponse / Response deadline: ${responseHours}h (avant le / before ${deadlineDate.toLocaleDateString('fr-FR')})
 
-RFQ INSTRUCTIONS - MULTIPARTS
+${clientInfo ? `INFORMATIONS CLIENT / CLIENT INFORMATION\n-----------------------------------------\n${clientInfo}\n` : ''}
+INSTRUCTIONS RFQ - MULTIPARTS
 =============================
+
+FRANÇAIS:
+---------
+Merci de nous transmettre votre offre avec:
+1) PRIX - Prix unitaire, Prix total, Devise (EUR/USD)
+2) INCOTERM - Ex-Works (EXW) ou CIF Abidjan
+3) LOGISTIQUE - Poids total (kg), Dimensions et nombre de colis
+4) TECHNIQUE - Fiche technique, Références constructeur, Normes
+5) DÉLAIS - Délai de livraison, Validité de l'offre
+6) CONDITIONS - Conditions de paiement, Origine des produits
+
+ENGLISH:
+--------
 Please provide your offer including:
+1) PRICING - Unit price, Total price, Currency (EUR/USD)
+2) INCOTERM - Ex-Works (EXW) or CIF Abidjan
+3) LOGISTICS - Total weight (kg), Dimensions and packages
+4) TECHNICAL - Data sheet, Manufacturer references, Standards
+5) LEAD TIMES - Delivery time, Offer validity
+6) TERMS - Payment terms, Country of origin
 
-1) PRICING
-   - Unit price for each item
-   - Total offer price
-   - Currency (EUR / USD / other)
-
-2) INCOTERM
-   - Ex-Works (EXW) or CIF Abidjan
-   - Exact EXW location (city, country)
-
-3) LOGISTICS
-   - Total weight (kg)
-   - Dimensions and number of packages
-
-4) TECHNICAL
-   - Technical data sheet / drawings
-   - Exact manufacturer references
-   - Standards and certifications
-
-5) LEAD TIMES
-   - Delivery time
-   - Offer validity
-
-6) COMMERCIAL TERMS
-   - Payment terms
-   - Country of origin
-
-DELIVERY ADDRESS
-----------------
+ADRESSE DE LIVRAISON / DELIVERY ADDRESS
+---------------------------------------
 ${COMPANY_INFO.name}
 ${addr.line1}
 ${addr.line2}
 ${addr.city}, ${addr.country}
 
-`;
-    }
-
-    body += `
 ---
 ${c.name}
 ${c.title}

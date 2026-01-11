@@ -51,6 +51,17 @@ export interface PriceRequestItem {
   originalLine?: number;        // Numéro de ligne dans le document original
 }
 
+/**
+ * Exigences client détectées dans l'email
+ */
+export interface ClientRequirements {
+  responseDeadline?: string;      // Délai de réponse exigé par le client (ex: "48h", "avant le 15/01")
+  responseDeadlineDate?: Date;    // Date calculée du délai de réponse
+  replyToEmail?: string;          // Adresse email de réponse spécifique exigée
+  urgent?: boolean;               // Demande marquée comme urgente
+  otherRequirements?: string[];   // Autres exigences détectées
+}
+
 export interface PriceRequest {
   requestNumber: string;
   clientRfqNumber?: string;
@@ -69,6 +80,7 @@ export interface PriceRequest {
   serialNumber?: string;
   needsManualReview?: boolean;   // true si au moins un item nécessite révision
   extractionMethod?: string;     // Méthode d'extraction utilisée
+  clientRequirements?: ClientRequirements; // Exigences spécifiques du client
 }
 
 export interface GeneratedPriceRequest {

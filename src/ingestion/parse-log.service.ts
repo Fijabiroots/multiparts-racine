@@ -140,7 +140,7 @@ export class ParseLogBuilder {
       detectedInputTypes: Array.from(this.detectedInputTypes),
       headerDetected: this.headerDetection?.found ?? false,
       headerScore: this.headerDetection?.score ?? 0,
-      headerPage: this.headerDetection?.pageIndex,
+      headerPage: undefined, // Simplified: page tracking removed
       headerLineIndex: this.headerDetection?.lineIndex,
       detectedColumns: (this.headerDetection?.columns ?? [])
         .filter((c) => c.type !== 'unknown')

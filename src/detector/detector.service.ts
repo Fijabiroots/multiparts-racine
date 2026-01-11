@@ -48,6 +48,21 @@ export class DetectorService {
     const subjectLower = email.subject.toLowerCase();
     const bodyLower = email.body.toLowerCase();
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // EXCLUSION: Bons de commande / Purchase Orders
+    // ═══════════════════════════════════════════════════════════════════════
+    const poExclusion = this.checkPurchaseOrderExclusion(subjectLower, bodyLower);
+    if (poExclusion.isPurchaseOrder) {
+      return {
+        isPriceRequest: false,
+        confidence: 0,
+        matchedKeywords: [],
+        hasRelevantAttachments: false,
+        attachmentTypes: [],
+        reason: `Exclu: ${poExclusion.reason}`,
+      };
+    }
+
     // Analyser chaque mot-clé
     for (const kw of this.keywords) {
       const keywordLower = kw.keyword.toLowerCase();
@@ -143,6 +158,62 @@ export class DetectorService {
       { id: '8', keyword: 'price request', weight: 9, language: 'en', type: 'both' },
       { id: '9', keyword: 'quote request', weight: 8, language: 'en', type: 'both' },
     ];
+  }
+
+  /**
+   * Vérifie si l'email concerne un bon de commande (à exclure du traitement RFQ)
+   */
+  private checkPurchaseOrderExclusion(subject: string, body: string): { isPurchaseOrder: boolean; reason?: string } {
+    const text = `${subject} ${body}`;
+
+    // Mots-clés de bon de commande / purchase order
+    const poKeywords = [
+      // Français
+      { pattern: /\bbon\s*de\s*commande\b/i, label: 'Bon de commande' },
+      { pattern: /\bcommande\s*n[°o]?\s*\d+/i, label: 'Numéro de commande' },
+      { pattern: /\bbc\s*n[°o]?\s*\d+/i, label: 'BC N°' },
+      { pattern: /\bnotre\s*commande\b/i, label: 'Notre commande' },
+      { pattern: /\bvotre\s*commande\b/i, label: 'Votre commande' },
+      { pattern: /\bconfirmation\s*de\s*commande\b/i, label: 'Confirmation de commande' },
+      { pattern: /\baccusé\s*de\s*réception\s*de\s*commande\b/i, label: 'Accusé de réception de commande' },
+      { pattern: /\bsuivi\s*de\s*commande\b/i, label: 'Suivi de commande' },
+
+      // Anglais
+      { pattern: /\bpurchase\s*order\b/i, label: 'Purchase Order' },
+      { pattern: /\bP\.?O\.?\s*#?\s*\d+/i, label: 'PO Number' },
+      { pattern: /\bPO\s*number\b/i, label: 'PO Number' },
+      { pattern: /\border\s*confirmation\b/i, label: 'Order confirmation' },
+      { pattern: /\border\s*acknowledgment\b/i, label: 'Order acknowledgment' },
+      { pattern: /\byour\s*order\b/i, label: 'Your order' },
+      { pattern: /\bour\s*order\b/i, label: 'Our order' },
+
+      // Patterns spécifiques dans le sujet (plus strict)
+      { pattern: /^(?:re:\s*)?(?:fw:\s*)?(?:tr:\s*)?\[?PO\b/i, label: 'Sujet commence par PO', subjectOnly: true },
+    ];
+
+    // Vérifier les patterns
+    for (const kw of poKeywords) {
+      const searchText = kw.subjectOnly ? subject : text;
+      if (kw.pattern.test(searchText)) {
+        return { isPurchaseOrder: true, reason: `${kw.label} détecté` };
+      }
+    }
+
+    // Vérifier les pièces jointes mentionnées qui suggèrent une commande
+    const poAttachmentPatterns = [
+      /bon\s*de\s*commande.*\.pdf/i,
+      /purchase.*order.*\.pdf/i,
+      /PO[-_]?\d+\.pdf/i,
+      /commande[-_]?\d+\.pdf/i,
+    ];
+
+    for (const pattern of poAttachmentPatterns) {
+      if (pattern.test(text)) {
+        return { isPurchaseOrder: true, reason: 'Pièce jointe de type commande mentionnée' };
+      }
+    }
+
+    return { isPurchaseOrder: false };
   }
 
   // Méthodes pour tests

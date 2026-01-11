@@ -348,11 +348,11 @@ export class TrackingService {
    */
   isRfqAlreadyTracked(clientRfqNumber: string, clientEmail: string): boolean {
     this.reloadWorkbook();
-    
+
     if (!this.workbook || !clientRfqNumber) return false;
 
     const todaySheet = this.getSheetName(new Date());
-    
+
     if (!this.workbook.SheetNames.includes(todaySheet)) {
       return false;
     }
@@ -369,5 +369,32 @@ export class TrackingService {
     }
 
     return false;
+  }
+
+  /**
+   * Réinitialise le fichier de suivi (MODE TEST)
+   * Crée un nouveau fichier vide
+   */
+  resetTracking(): { success: boolean; previousStats: any } {
+    try {
+      const previousStats = this.getStatistics();
+
+      // Supprimer le fichier existant
+      if (fs.existsSync(this.trackingFilePath)) {
+        fs.unlinkSync(this.trackingFilePath);
+      }
+
+      // Créer un nouveau workbook vide
+      this.workbook = XLSX.utils.book_new();
+      this.createIndexSheet();
+      this.saveWorkbook();
+
+      this.logger.warn(`🔄 RESET: Fichier de suivi réinitialisé - ${previousStats.totalEntries} entrées supprimées`);
+
+      return { success: true, previousStats };
+    } catch (error) {
+      this.logger.error(`Erreur réinitialisation fichier de suivi: ${error.message}`);
+      return { success: false, previousStats: null };
+    }
   }
 }

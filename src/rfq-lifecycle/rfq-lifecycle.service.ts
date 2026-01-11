@@ -37,6 +37,9 @@ export interface SentRfq {
   clientName?: string;
   itemCount?: number;
   deadline?: Date;
+  clientReceivedAt?: Date;              // Date de réception de la demande client
+  clientReassuranceSentAt?: Date;       // Dernière date d'envoi d'email de suivi au client
+  clientReassuranceCount?: number;      // Nombre d'emails de suivi envoyés au client
 }
 
 /**
@@ -519,5 +522,67 @@ export class RfqLifecycleService {
    */
   getQuotesForRfq(rfqNumber: string): SupplierQuote[] {
     return this.supplierQuotes.get(rfqNumber) || [];
+  }
+
+  /**
+   * Marquer un email de suivi client comme envoyé
+   */
+  markClientReassuranceSent(rfqNumber: string): void {
+    const rfq = this.sentRfqs.get(rfqNumber);
+    if (rfq) {
+      rfq.clientReassuranceSentAt = new Date();
+      rfq.clientReassuranceCount = (rfq.clientReassuranceCount || 0) + 1;
+      this.saveData();
+      this.logger.log(`Email de suivi client envoyé pour ${rfqNumber} (count: ${rfq.clientReassuranceCount})`);
+    }
+  }
+
+  /**
+   * Vérifier si un email de suivi client est nécessaire
+   * Envoyer un email de suivi si des relances ont été faites et qu'on n'a pas encore informé le client
+   */
+  needsClientReassurance(rfqNumber: string, minDaysSinceLastReassurance = 3): boolean {
+    const rfq = this.sentRfqs.get(rfqNumber);
+    if (!rfq || !rfq.clientEmail) return false;
+
+    // Vérifier si au moins un fournisseur a été relancé
+    const hasRemindedSuppliers = rfq.suppliers.some(s => s.reminderCount > 0);
+    if (!hasRemindedSuppliers) return false;
+
+    // Si jamais envoyé de suivi, on doit en envoyer un
+    if (!rfq.clientReassuranceSentAt) return true;
+
+    // Vérifier si assez de temps s'est écoulé depuis le dernier suivi
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - minDaysSinceLastReassurance);
+    return new Date(rfq.clientReassuranceSentAt) < cutoffDate;
+  }
+
+  /**
+   * Obtenir les RFQs qui nécessitent un email de suivi client
+   */
+  getRfqsNeedingClientReassurance(minDaysSinceLastReassurance = 3): SentRfq[] {
+    const rfqs: SentRfq[] = [];
+    for (const rfq of this.sentRfqs.values()) {
+      if (this.needsClientReassurance(rfq.internalRfqNumber, minDaysSinceLastReassurance)) {
+        rfqs.push(rfq);
+      }
+    }
+    return rfqs;
+  }
+
+  /**
+   * Marquer un fournisseur comme sans réponse (après max relances)
+   */
+  markSupplierNoResponse(rfqNumber: string, supplierEmail: string): void {
+    const rfq = this.sentRfqs.get(rfqNumber);
+    if (rfq) {
+      const supplier = rfq.suppliers.find(s => s.email === supplierEmail);
+      if (supplier) {
+        supplier.status = 'sans_réponse';
+        this.saveData();
+        this.logger.log(`Fournisseur ${supplierEmail} marqué sans réponse pour ${rfqNumber}`);
+      }
+    }
   }
 }

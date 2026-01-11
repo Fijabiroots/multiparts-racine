@@ -151,4 +151,30 @@ export class DatabaseController {
     const logs = await this.databaseService.getProcessingLogs(limit ? parseInt(limit, 10) : 100);
     return { count: logs.length, logs };
   }
+
+  // ============ RESET (MODE TEST) ============
+
+  /**
+   * Réinitialise les données de traitement pour permettre de retraiter tous les emails.
+   * ATTENTION: Cette action est irréversible!
+   * Conserve: clients, detection_keywords, processing_config, known_suppliers
+   * Vide: rfq_mappings, processing_logs, pending_drafts, output_logs
+   */
+  @Post('reset')
+  async resetProcessingData(@Body() body?: { confirm?: boolean }) {
+    if (!body?.confirm) {
+      return {
+        error: 'Confirmation requise',
+        message: 'Envoyez { "confirm": true } pour confirmer la réinitialisation',
+        warning: 'Cette action videra rfq_mappings, processing_logs, pending_drafts et output_logs',
+      };
+    }
+
+    const counts = await this.databaseService.resetProcessingData();
+    return {
+      success: true,
+      message: 'Données de traitement réinitialisées',
+      deleted: counts,
+    };
+  }
 }
