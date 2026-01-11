@@ -183,6 +183,24 @@ export interface ParseLog {
   warnings: string[];
   errors: string[];
 
+  // Multiline merging
+  mergedContinuationLines?: number;
+
+  // Extraction path: which method was used
+  extractionPath?: 'pdfjs_layout' | 'pdf-parse' | 'ocr' | 'mixed';
+
+  // Layout reconstruction stats (when pdfjs_layout is used)
+  layoutStats?: {
+    totalPages: number;
+    totalTokens: number;
+    totalRows: number;
+    avgCellsPerRow: number;
+    medianGapX: number;
+  };
+
+  // Brand detection
+  unknownBrandCandidates?: string[];
+
   // Performance
   processingTimeMs: number;
   extractionMethod: string;
