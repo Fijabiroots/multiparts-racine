@@ -235,6 +235,21 @@ RÈGLES D'EXTRACTION:
 6. IGNORE les en-têtes répétés, pieds de page, mentions légales
 7. Si un champ n'existe pas, utilise null
 
+EXTRACTION DES RÉFÉRENCES FOURNISSEUR (part_number):
+Si la description contient une marque suivie d'un code alphanumérique, extrais ce code comme part_number.
+
+Exemple: "BLOCK DISTR 250A SP APPLIED UKK250A"
+- brand: "APPLIED"
+- part_number: "UKK250A" (le code après la marque)
+- description: "BLOCK DISTR 250A SP" (sans la marque et le part_number)
+
+Patterns courants:
+- "... BRAND PARTNUMBER" → extraire PARTNUMBER
+- "... BRAND MODEL-123" → extraire MODEL-123
+- Le part_number est généralement un code court (3-15 caractères alphanumériques)
+- item_code = code interne client (ex: 135382)
+- part_number = référence fournisseur/fabricant (ex: UKK250A, RTD6X1350)
+
 ATTENTION CRITIQUE - NUMÉROS DE LIGNE vs QUANTITÉS:
 Les documents Purchase Requisition ont souvent une colonne "Line" avec des numéros séquentiels (10, 20, 30, 40...).
 Ces numéros de ligne NE SONT PAS des quantités !
