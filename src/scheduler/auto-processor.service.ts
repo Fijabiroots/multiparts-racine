@@ -410,8 +410,8 @@ export class AutoProcessorService {
       }
     }
 
-    // 3.5 LLM Fallback: Si peu d'items extraits et LLM activé
-    const shouldUseLlm = this.shouldTriggerLlmFallback(allItems.length, needsManualReview);
+    // 3.5 LLM Fallback: Si peu d'items extraits, quantités suspectes, ou LLM_MODE=always
+    const shouldUseLlm = this.shouldTriggerLlmFallback(allItems.length, needsManualReview, allItems);
     if (shouldUseLlm && this.llmExtraction && this.canonicalAdapter) {
       this.logger.log(`LLM Fallback triggered: ${allItems.length} items extracted, mode=${this.llmMode}`);
 
@@ -425,8 +425,15 @@ export class AutoProcessorService {
         const llmResult = await this.llmExtraction.extractAndMerge(llmInputs);
         const llmItems = this.canonicalAdapter.toPriceRequestItems(llmResult);
 
-        if (llmItems.length > allItems.length) {
-          this.logger.log(`LLM extracted ${llmItems.length} items (vs ${allItems.length} from regex)`);
+        // En mode 'always', utiliser LLM si résultats valides
+        // Sinon, utiliser LLM seulement s'il extrait plus d'items
+        const shouldUseLlmResults =
+          this.llmMode === 'always'
+            ? llmItems.length > 0
+            : llmItems.length > allItems.length;
+
+        if (shouldUseLlmResults) {
+          this.logger.log(`LLM extracted ${llmItems.length} items (vs ${allItems.length} from regex), mode=${this.llmMode}`);
           allItems = llmItems.map(item => ({
             ...item,
             brand: item.brand || group.brand,
@@ -439,6 +446,8 @@ export class AutoProcessorService {
           if (llmResult._meta.confidence_score < this.llmMinConfidenceThreshold) {
             needsManualReview = true;
           }
+        } else {
+          this.logger.debug(`LLM results not used: ${llmItems.length} LLM items vs ${allItems.length} regex items`);
         }
       } catch (llmError) {
         this.logger.error(`LLM extraction failed: ${llmError}`);
@@ -1209,9 +1218,14 @@ Pour toute correspondance, veuillez utiliser la référence : ${rfqNumber}`;
    * Détermine si le fallback LLM doit être activé
    * @param itemCount Nombre d'items extraits par regex
    * @param needsManualReview Flag de révision manuelle
+   * @param items Items extraits (optionnel, pour vérifier quantités suspectes)
    * @returns true si LLM doit être utilisé
    */
-  private shouldTriggerLlmFallback(itemCount: number, needsManualReview: boolean): boolean {
+  private shouldTriggerLlmFallback(
+    itemCount: number,
+    needsManualReview: boolean,
+    items?: PriceRequestItem[],
+  ): boolean {
     switch (this.llmMode) {
       case 'always':
         // Toujours utiliser LLM (pour tests)
@@ -1219,7 +1233,30 @@ Pour toute correspondance, veuillez utiliser la référence : ${rfqNumber}`;
 
       case 'auto':
         // LLM si peu d'items ou extraction incertaine
-        return itemCount < this.llmMinItemsThreshold || needsManualReview;
+        if (itemCount < this.llmMinItemsThreshold || needsManualReview) {
+          return true;
+        }
+
+        // Vérifier si les quantités semblent suspectes (possibles numéros de ligne)
+        if (items && items.length > 0) {
+          const suspiciousQtyCount = items.filter(item => {
+            const qty = item.quantity;
+            // Quantités suspectes: multiples de 10 (10, 20, 30, 40...)
+            // et valeurs typiques de numéros de ligne
+            return qty && qty >= 10 && qty % 10 === 0 && qty <= 100;
+          }).length;
+
+          // Si plus de 50% des items ont des quantités suspectes
+          if (suspiciousQtyCount > items.length / 2) {
+            this.logger.warn(
+              `Quantités suspectes détectées (${suspiciousQtyCount}/${items.length} ` +
+              `multiples de 10 entre 10-100), déclenchement LLM`,
+            );
+            return true;
+          }
+        }
+
+        return false;
 
       case 'fallback':
         // LLM seulement si aucun item

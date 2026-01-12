@@ -235,6 +235,26 @@ RÈGLES D'EXTRACTION:
 6. IGNORE les en-têtes répétés, pieds de page, mentions légales
 7. Si un champ n'existe pas, utilise null
 
+ATTENTION CRITIQUE - NUMÉROS DE LIGNE vs QUANTITÉS:
+Les documents Purchase Requisition ont souvent une colonne "Line" avec des numéros séquentiels (10, 20, 30, 40...).
+Ces numéros de ligne NE SONT PAS des quantités !
+
+Exemple de tableau PDF:
+| Line | Qty | UOM | Item Code | Description |
+|------|-----|-----|-----------|-------------|
+| 10   | 5   | EA  | 201368    | RELAY...    |
+| 20   | 3   | EA  | 201369    | FILTER...   |
+
+Dans cet exemple:
+- "10" et "20" sont des NUMÉROS DE LIGNE (à stocker dans line_number)
+- "5" et "3" sont les VRAIES QUANTITÉS (à stocker dans quantity)
+
+Règles quantités:
+1. Si tu vois des nombres comme 10, 20, 30, 40... en première colonne, ce sont des numéros de ligne
+2. La quantité est généralement un petit nombre (1-100)
+3. Les quantités de 10, 20, 30 exactement sont suspectes - vérifie que ce n'est pas un numéro de ligne
+4. Cherche la colonne "Qty" ou "Quantity" pour la vraie quantité
+
 RETOURNE UNIQUEMENT un JSON valide avec cette structure:
 {
   "_meta": {

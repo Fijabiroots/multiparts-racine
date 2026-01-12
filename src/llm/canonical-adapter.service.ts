@@ -22,7 +22,7 @@ export class CanonicalAdapterService {
    * Convertit un CanonicalLineItem vers PriceRequestItem
    */
   private toItem(
-    item: CanonicalLineItem, 
+    item: CanonicalLineItem,
     doc: CanonicalDocument,
     index: number
   ): PriceRequestItem {
@@ -31,9 +31,9 @@ export class CanonicalAdapterService {
       reference: item.part_number || item.item_code,
       internalCode: item.item_code,
       supplierCode: item.part_number,
-      
-      // Description
-      description: item.description,
+
+      // Description (dédoublonnée si nécessaire)
+      description: this.deduplicateDescription(item.description),
       brand: item.brand,
       
       // Quantité
@@ -158,6 +158,38 @@ export class CanonicalAdapterService {
     // Le type canonique (RFQ, PR, etc.) n'est pas le format de fichier
     // On retourne 'pdf' par défaut car c'est le plus courant
     return 'pdf';
+  }
+
+  /**
+   * Supprime les descriptions doublées du type "ABC - ABC" ou "ABC / ABC"
+   * Les PDFs Endeavour ont parfois la description répétée avec un séparateur
+   */
+  private deduplicateDescription(description: string): string {
+    if (!description) return description;
+
+    // Séparateurs courants
+    const separators = [' - ', ' / ', ' | ', ' – ', ' — '];
+
+    for (const sep of separators) {
+      const parts = description.split(sep);
+      if (parts.length === 2) {
+        const first = parts[0].trim().toLowerCase();
+        const second = parts[1].trim().toLowerCase();
+
+        // Si les deux parties sont identiques ou quasi-identiques
+        if (first === second) {
+          return parts[0].trim();
+        }
+
+        // Vérifier si l'une est préfixe de l'autre (cas de troncature)
+        if (first.startsWith(second) || second.startsWith(first)) {
+          // Garder la plus longue
+          return parts[0].length >= parts[1].length ? parts[0].trim() : parts[1].trim();
+        }
+      }
+    }
+
+    return description;
   }
 
   /**

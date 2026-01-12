@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { EmailService } from '../email/email.service';
 import { PdfService } from '../pdf/pdf.service';
@@ -7,6 +7,7 @@ import { DraftService } from '../draft/draft.service';
 import { AcknowledgmentService } from '../acknowledgment/acknowledgment.service';
 import { TrackingService } from '../tracking/tracking.service';
 import { WebhookService } from '../webhook/webhook.service';
+import { DocumentExtractionService, CanonicalAdapterService } from '../llm';
 import {
   ParsedEmail,
   PriceRequest,
@@ -40,6 +41,11 @@ export class PriceRequestService {
   private readonly DEFAULT_RECIPIENT = 'procurement@multipartsci.com';
   private readonly DEFAULT_RESPONSE_HOURS = 24;
 
+  // LLM configuration
+  private readonly llmMode: string;
+  private readonly llmMinItemsThreshold: number;
+  private readonly llmMinConfidenceThreshold: number;
+
   constructor(
     private readonly configService: ConfigService,
     private readonly emailService: EmailService,
@@ -49,7 +55,14 @@ export class PriceRequestService {
     private readonly acknowledgmentService: AcknowledgmentService,
     private readonly trackingService: TrackingService,
     private readonly webhookService: WebhookService,
-  ) {}
+    @Optional() private readonly llmExtraction?: DocumentExtractionService,
+    @Optional() private readonly canonicalAdapter?: CanonicalAdapterService,
+  ) {
+    this.llmMode = this.configService.get<string>('LLM_MODE', 'off');
+    this.llmMinItemsThreshold = this.configService.get<number>('LLM_MIN_ITEMS_THRESHOLD', 3);
+    this.llmMinConfidenceThreshold = this.configService.get<number>('LLM_MIN_CONFIDENCE_THRESHOLD', 60);
+    this.logger.log(`LLM Mode: ${this.llmMode}`);
+  }
 
   async processEmailById(emailId: string, folder = 'INBOX', supplierEmail?: string): Promise<ProcessEmailResult> {
     try {
@@ -166,11 +179,56 @@ export class PriceRequestService {
 
       // Si toujours rien, retourner une erreur
       if (extractedData.length === 0 || extractedData.every(d => d.items.length === 0)) {
-        return { 
-          success: false, 
-          email, 
-          error: 'Aucune demande détectée (ni dans les PDF, ni dans le corps de l\'email)' 
+        return {
+          success: false,
+          email,
+          error: 'Aucune demande détectée (ni dans les PDF, ni dans le corps de l\'email)'
         };
+      }
+
+      // LLM Fallback: Améliorer l'extraction si LLM activé
+      const allRegexItems = extractedData.flatMap(d => d.items);
+      const shouldUseLlm = this.shouldTriggerLlmFallback(allRegexItems);
+
+      if (shouldUseLlm && this.llmExtraction && this.canonicalAdapter) {
+        this.logger.log(`LLM Fallback triggered: ${allRegexItems.length} items from regex, mode=${this.llmMode}`);
+
+        try {
+          const llmInputs = pdfAttachments.map(att => ({
+            content: att.content,
+            filename: att.filename,
+            mimeType: att.contentType,
+          }));
+
+          const llmResult = await this.llmExtraction.extractAndMerge(llmInputs);
+          const llmItems = this.canonicalAdapter.toPriceRequestItems(llmResult);
+
+          // En mode 'always', utiliser LLM si résultats valides
+          // Sinon, utiliser LLM seulement s'il extrait plus d'items
+          const shouldUseLlmResults =
+            this.llmMode === 'always'
+              ? llmItems.length > 0
+              : llmItems.length > allRegexItems.length;
+
+          if (shouldUseLlmResults) {
+            this.logger.log(`LLM extracted ${llmItems.length} items (vs ${allRegexItems.length} from regex), using LLM results`);
+
+            // Remplacer les items dans extractedData
+            extractedData = [{
+              filename: extractedData[0]?.filename || 'llm_extraction',
+              text: extractedData[0]?.text || '',
+              items: llmItems,
+              rfqNumber: llmResult.document_number !== 'UNKNOWN' ? llmResult.document_number : extractedData[0]?.rfqNumber,
+              generalDescription: llmResult.general_description,
+              needsVerification: llmResult._meta.confidence_score < this.llmMinConfidenceThreshold,
+            }];
+          } else {
+            this.logger.debug(`LLM results not used: ${llmItems.length} LLM items vs ${allRegexItems.length} regex items`);
+          }
+        } catch (llmError) {
+          this.logger.error(`LLM extraction failed: ${llmError}`);
+          // Continue with regex results
+        }
       }
 
       // 3. Construire la demande de prix
@@ -534,5 +592,47 @@ export class PriceRequestService {
       extractedItems: extractedData.flatMap((d) => d.items),
       totalItems: extractedData.reduce((sum, d) => sum + d.items.length, 0),
     };
+  }
+
+  /**
+   * Détermine si le fallback LLM doit être activé
+   */
+  private shouldTriggerLlmFallback(items: PriceRequestItem[]): boolean {
+    switch (this.llmMode) {
+      case 'always':
+        return true;
+
+      case 'auto':
+        // LLM si peu d'items
+        if (items.length < this.llmMinItemsThreshold) {
+          return true;
+        }
+
+        // Vérifier si les quantités semblent suspectes (possibles numéros de ligne)
+        if (items.length > 0) {
+          const suspiciousQtyCount = items.filter(item => {
+            const qty = item.quantity;
+            // Quantités suspectes: multiples de 10 (10, 20, 30, 40...)
+            return qty && qty >= 10 && qty % 10 === 0 && qty <= 100;
+          }).length;
+
+          // Si plus de 50% des items ont des quantités suspectes
+          if (suspiciousQtyCount > items.length / 2) {
+            this.logger.warn(
+              `Quantités suspectes détectées (${suspiciousQtyCount}/${items.length} multiples de 10), déclenchement LLM`,
+            );
+            return true;
+          }
+        }
+
+        return false;
+
+      case 'fallback':
+        return items.length === 0;
+
+      case 'off':
+      default:
+        return false;
+    }
   }
 }
