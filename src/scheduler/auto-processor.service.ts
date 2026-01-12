@@ -1,4 +1,5 @@
 import { Injectable, Logger, Optional } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { DatabaseService } from '../database/database.service';
 import { EmailService } from '../email/email.service';
 import { DetectorService } from '../detector/detector.service';
@@ -9,6 +10,7 @@ import { DraftService } from '../draft/draft.service';
 import { TrackingService } from '../tracking/tracking.service';
 import { UnifiedIngestionService } from '../ingestion/unified-ingestion.service';
 import { ParseLogService } from '../ingestion/parse-log.service';
+import { DocumentExtractionService, CanonicalAdapterService } from '../llm';
 import { ParsedEmail, PriceRequest, PriceRequestItem, ClientRequirements, EmailAttachment } from '../common/interfaces';
 import { Client } from '../database/entities';
 import {
@@ -66,10 +68,16 @@ export class AutoProcessorService {
   // Flag to use the new unified ingestion pipeline (set to true to enable)
   private readonly useUnifiedIngestion = true;
 
+  // LLM mode: 'off', 'auto', 'fallback', 'always'
+  private readonly llmMode: string;
+  private readonly llmMinItemsThreshold: number;
+  private readonly llmMinConfidenceThreshold: number;
+
   // Adresse email courante du mailbox en cours de traitement
   private currentMailbox: string = 'procurement@multipartsci.com';
 
   constructor(
+    private readonly configService: ConfigService,
     private readonly databaseService: DatabaseService,
     private readonly emailService: EmailService,
     private readonly detectorService: DetectorService,
@@ -80,7 +88,14 @@ export class AutoProcessorService {
     private readonly trackingService: TrackingService,
     @Optional() private readonly unifiedIngestion?: UnifiedIngestionService,
     @Optional() private readonly parseLogService?: ParseLogService,
-  ) {}
+    @Optional() private readonly llmExtraction?: DocumentExtractionService,
+    @Optional() private readonly canonicalAdapter?: CanonicalAdapterService,
+  ) {
+    this.llmMode = this.configService.get<string>('LLM_MODE', 'off');
+    this.llmMinItemsThreshold = this.configService.get<number>('LLM_MIN_ITEMS_THRESHOLD', 3);
+    this.llmMinConfidenceThreshold = this.configService.get<number>('LLM_MIN_CONFIDENCE_THRESHOLD', 60);
+    this.logger.log(`LLM Mode: ${this.llmMode}, Min Items: ${this.llmMinItemsThreshold}, Min Confidence: ${this.llmMinConfidenceThreshold}`);
+  }
 
   async processNewEmails(options: ProcessOptions): Promise<ProcessResult> {
     const result: ProcessResult = {
@@ -392,6 +407,42 @@ export class AutoProcessorService {
         if (doc.needsVerification) {
           needsManualReview = true;
         }
+      }
+    }
+
+    // 3.5 LLM Fallback: Si peu d'items extraits et LLM activé
+    const shouldUseLlm = this.shouldTriggerLlmFallback(allItems.length, needsManualReview);
+    if (shouldUseLlm && this.llmExtraction && this.canonicalAdapter) {
+      this.logger.log(`LLM Fallback triggered: ${allItems.length} items extracted, mode=${this.llmMode}`);
+
+      try {
+        const llmInputs = groupAttachments.map(att => ({
+          content: att.content,
+          filename: att.filename,
+          mimeType: att.contentType,
+        }));
+
+        const llmResult = await this.llmExtraction.extractAndMerge(llmInputs);
+        const llmItems = this.canonicalAdapter.toPriceRequestItems(llmResult);
+
+        if (llmItems.length > allItems.length) {
+          this.logger.log(`LLM extracted ${llmItems.length} items (vs ${allItems.length} from regex)`);
+          allItems = llmItems.map(item => ({
+            ...item,
+            brand: item.brand || group.brand,
+          }));
+
+          if (!clientRfqNumber && llmResult.document_number !== 'UNKNOWN') {
+            clientRfqNumber = llmResult.document_number;
+          }
+
+          if (llmResult._meta.confidence_score < this.llmMinConfidenceThreshold) {
+            needsManualReview = true;
+          }
+        }
+      } catch (llmError) {
+        this.logger.error(`LLM extraction failed: ${llmError}`);
+        // Continue with regex results
       }
     }
 
@@ -950,88 +1001,233 @@ Pour toute correspondance, veuillez utiliser la référence : ${rfqNumber}`;
   }
 
   /**
-   * Vérifie si l'email est une offre/réponse fournisseur (pas une demande client)
-   * Ces emails ne doivent PAS être traités comme des RFQ
+   * Vérifie si l'email est une offre/réponse fournisseur (pas une demande client).
+   * Objectif: filtrer les devis/offres/proformas/invoices, sans exclure les RFQ clients,
+   * y compris les nouveaux clients (domaines inconnus).
+   *
+   * Politique anti-perte business:
+   * - On ne classe OFFER que si preuves fortes (hard rules) ou score offre dominant.
+   * - Sinon, on laisse passer (isSupplierQuote=false).
    */
-  private async isSupplierQuote(email: ParsedEmail): Promise<{ isSupplierQuote: boolean; reason?: string }> {
-    const subject = email.subject.toLowerCase();
-    const body = email.body.toLowerCase();
-    const from = email.from.toLowerCase();
+  private async isSupplierQuote(
+    email: ParsedEmail,
+  ): Promise<{ isSupplierQuote: boolean; reason?: string }> {
+    const subject = (email.subject || '').toLowerCase();
+    const body = (email.body || '').toLowerCase();
+    const from = (email.from || '').toLowerCase();
 
-    // 1. Vérifier si c'est une réponse (RE:, FW:, TR:)
-    if (/^(re:|fw:|fwd:|tr:)/i.test(email.subject)) {
-      // Vérifier si c'est une réponse à notre propre demande
-      if (subject.includes('demande de prix') || subject.includes('ddp-')) {
-        return { isSupplierQuote: true, reason: 'Réponse à une demande de prix' };
-      }
-    }
+    // Fenêtre plus large que 1000 chars (les totaux/banque/validité sont souvent plus bas)
+    const bodyWindow = body.substring(0, 6000);
 
-    // 2. Vérifier les mots-clés d'offre fournisseur dans le sujet
-    const supplierKeywords = [
-      'offre de prix',
-      'proposition commerciale',
-      'cotation',
-      'notre offre',
-      'votre demande',
-      'suite à votre',
-      'en réponse à',
-      'quotation',
-      'our quote',
-      'price quotation',
-      'proforma',
-      'pro forma',
-      'invoice',
-      'facture',
-    ];
-
-    for (const keyword of supplierKeywords) {
-      if (subject.includes(keyword) || body.substring(0, 500).includes(keyword)) {
-        return { isSupplierQuote: true, reason: `Mot-clé fournisseur: "${keyword}"` };
-      }
-    }
-
-    // 3. Vérifier si l'expéditeur est un fournisseur connu
     const senderEmail = this.extractEmail(from);
-    const isKnownSupplier = await this.databaseService.isKnownSupplier(senderEmail);
-    
-    if (isKnownSupplier) {
-      return { isSupplierQuote: true, reason: `Fournisseur connu: ${senderEmail}` };
+
+    // ─────────────────────────────────────────────────────────────
+    // 1) Thread rules (RE/FW/TR) + références internes
+    // ─────────────────────────────────────────────────────────────
+    const isThreadReply = /^(re:|fw:|fwd:|tr:)/i.test(email.subject || '');
+    const hasInternalRef = /ddp-\d{8}-\d{3}/i.test(subject);
+    const mentionsOurRequest = subject.includes('demande de prix') || subject.includes('ddp-');
+
+    if (isThreadReply && (hasInternalRef || mentionsOurRequest)) {
+      return { isSupplierQuote: true, reason: 'Réponse thread sur référence interne (DDP/demande de prix)' };
     }
 
-    // 4. Vérifier si le sujet contient un numéro de demande interne (réponse à notre demande)
-    if (/ddp-\d{8}-\d{3}/i.test(subject)) {
-      return { isSupplierQuote: true, reason: 'Référence interne DDP détectée' };
-    }
+    // ─────────────────────────────────────────────────────────────
+    // 2) Keyword sets (FR/EN)
+    // ─────────────────────────────────────────────────────────────
+    const requestKeywords = [
+      // EN (explicit)
+      'request for quotation', 'request for quote', 'quotation request', 'rfq',
+      'please quote', 'kindly quote', 'could you quote', 'would you quote',
+      'please provide your quote', 'please submit your quotation',
+      'please advise your best price', 'please indicate your price',
 
-    // 5. Vérifier si le corps contient des signes d'offre
-    const offerPatterns = [
-      /total\s*:\s*[\d\s.,]+\s*(€|EUR|USD|XOF)/i,
-      /prix\s*total\s*:\s*[\d\s.,]+/i,
-      /montant\s*(ht|ttc)\s*:\s*[\d\s.,]+/i,
-      /veuillez\s+trouver\s+(ci-joint|en\s+pj)\s+(notre|votre)\s+offre/i,
-      /nous\s+vous\s+(proposons|offrons)/i,
+      // EN (purchase intent)
+      'we would like to purchase', 'we are looking for', 'we require pricing for',
+      'we request pricing for', 'we need a price for',
+
+      // FR (explicit)
+      'demande de devis', 'demande de prix', 'demande de cotation',
+      'consultation de prix', 'appel d\'offres',
+
+      // FR (polite / implicit)
+      'merci de coter', 'merci de chiffrer', 'pourriez-vous nous chiffrer',
+      'merci de nous communiquer vos prix', 'merci de nous indiquer vos meilleurs prix',
+      'merci de nous transmettre', 'priere de nous faire parvenir', 'prière de nous faire parvenir',
+      'merci de nous adresser votre offre',
     ];
 
-    for (const pattern of offerPatterns) {
-      if (pattern.test(body)) {
-        return { isSupplierQuote: true, reason: 'Pattern d\'offre détecté dans le corps' };
+    const offerKeywords = [
+      // Strong offer phrases (EN)
+      'our quotation', 'our quote',
+      'we are pleased to offer', 'we are pleased to quote',
+      'we quote as follows',
+      'please find our quotation', 'please find attached our quotation',
+      'attached our quotation', 'attached our offer',
+
+      // Strong offer phrases (FR)
+      'offre de prix', 'proposition commerciale', 'notre offre', 'notre cotation',
+      'ci-joint notre offre', 'veuillez trouver ci-joint notre offre',
+      'nous vous proposons', 'nous vous offrons',
+
+      // Finance docs
+      'proforma', 'pro forma', 'invoice', 'facture',
+
+      // Totals/taxes keywords (kept also in regex section)
+      'subtotal', 'grand total', 'vat', 'tax',
+      'tva', 'prix total', 'montant ht', 'montant ttc', 'total ht', 'total ttc',
+
+      // Bank/payment keywords (kept also in regex section)
+      'bank details', 'iban', 'swift', 'beneficiary',
+      'coordonnees bancaires', 'coordonnées bancaires', 'rib',
+      'payment terms', 'terms of payment',
+
+      // Validity keywords (kept also in regex section)
+      'valid until', 'valid for', 'validity',
+      'validite', 'validité',
+
+      // Identifiers (kept also in regex section)
+      'quotation no', 'quote no', 'quotation number', 'offer no', 'offer number',
+      'devis n°', 'devis no', 'offre n°', 'offre no',
+    ];
+
+    // Helper: add score based on includes()
+    const addScore = (text: string, kws: string[], points: number): number => {
+      let score = 0;
+      for (const k of kws) {
+        if (k && text.includes(k)) score += points;
+      }
+      return score;
+    };
+
+    let requestScore = 0;
+    let offerScore = 0;
+
+    // Request: subject more important than body (often explicit in subject)
+    requestScore += addScore(subject, requestKeywords, 2);
+    requestScore += addScore(bodyWindow, requestKeywords, 1);
+
+    // Offer: high confidence signals
+    offerScore += addScore(subject, offerKeywords, 3);
+    offerScore += addScore(bodyWindow, offerKeywords, 2);
+
+    // ─────────────────────────────────────────────────────────────
+    // 3) Attachment filename heuristics (no content parsing)
+    // ─────────────────────────────────────────────────────────────
+    for (const att of email.attachments || []) {
+      const fn = (att.filename || '').toLowerCase();
+      // Offres/devis fréquents en PJ
+      if (/(quotation|quote|offer|proforma|invoice|devis|cotation|inv[-_]|pi[-_]|qt[-_])/i.test(fn)) {
+        offerScore += 2;
       }
     }
 
-    // 6. Vérifier le domaine de l'expéditeur (clients connus)
-    const knownClientDomains = [
-      'endeavourmining.com',
-      'endeavour.com',
-      'ity.ci',
-      // Ajouter d'autres domaines clients ici
-    ];
+    // ─────────────────────────────────────────────────────────────
+    // 4) Hard rules (preuves structure devis)
+    // ─────────────────────────────────────────────────────────────
+    const hasQuoteNumber =
+      /(\bquotation\b|\bquote\b|\boffer\b)\s*(no|n°|#|number)\s*[:\-]?\s*[a-z0-9\-\/]{3,}/i.test(bodyWindow) ||
+      /(devis|offre)\s*(no|n°|#)\s*[:\-]?\s*[a-z0-9\-\/]{3,}/i.test(bodyWindow);
 
-    const senderDomain = senderEmail.split('@')[1];
-    if (knownClientDomains.some(d => senderDomain?.includes(d))) {
-      // C'est probablement une demande client, pas une offre
+    const hasValidity =
+      /\b(valid until|validity|valid for)\b/i.test(bodyWindow) ||
+      /\b(validite|validité)\b/i.test(bodyWindow);
+
+    const hasTotals =
+      /\b(subtotal|grand total|total|vat|tax)\b/i.test(bodyWindow) ||
+      /\b(tva|montant|prix total|total ht|total ttc)\b/i.test(bodyWindow);
+
+    const hasBank =
+      /\b(iban|swift|beneficiary|bank details)\b/i.test(bodyWindow) ||
+      /\b(rib|coordonnees bancaires|coordonnées bancaires)\b/i.test(bodyWindow);
+
+    const hasProformaOrInvoice =
+      /\b(proforma|pro forma|invoice|facture)\b/i.test(bodyWindow) ||
+      subject.includes('proforma') || subject.includes('invoice') || subject.includes('facture');
+
+    // "In response to your RFQ" => c'est généralement une offre fournisseur
+    const responseToRFQ =
+      /\b(in response to your rfq|as per your rfq|ref[: ]\s*rfq|suite a votre rfq|en reponse a votre)\b/i.test(bodyWindow);
+
+    if (responseToRFQ) offerScore += 3;
+
+    // HARD: quote number + validity + (totals or bank) => OFFER
+    if (hasQuoteNumber && hasValidity && (hasTotals || hasBank)) {
+      return { isSupplierQuote: true, reason: 'Structure devis détectée (numéro + validité + total/banque)' };
+    }
+
+    // HARD: totals + bank => OFFER
+    if (hasTotals && hasBank) {
+      return { isSupplierQuote: true, reason: 'Structure devis détectée (total + banque)' };
+    }
+
+    // HARD: proforma/invoice + totals => OFFER
+    if (hasProformaOrInvoice && hasTotals) {
+      return { isSupplierQuote: true, reason: 'Proforma/Facture avec totaux détectés' };
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 5) Known supplier: only if offer signals exist (not absolute)
+    // ─────────────────────────────────────────────────────────────
+    const isKnownSupplier = await this.databaseService.isKnownSupplier(senderEmail);
+    if (isKnownSupplier) {
+      // On filtre si l'email ressemble à une offre (score suffisant)
+      if (offerScore >= 5 && offerScore >= requestScore) {
+        return { isSupplierQuote: true, reason: `Fournisseur connu + signaux offre (offer=${offerScore}, request=${requestScore})` };
+      }
+      // Sinon, on ne bloque pas par défaut
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 6) Score decision with margin (no domain blocking)
+    // ─────────────────────────────────────────────────────────────
+    // Classer OFFER uniquement si dominance claire
+    if (offerScore >= requestScore + 3 && offerScore >= 5) {
+      return { isSupplierQuote: true, reason: `Signaux offre dominants (offer=${offerScore}, request=${requestScore})` };
+    }
+
+    // Si demande clairement dominante, ne pas filtrer
+    if (requestScore >= offerScore + 2 && requestScore >= 3) {
       return { isSupplierQuote: false };
     }
 
+    // ─────────────────────────────────────────────────────────────
+    // 7) Anti-perte business: ambiguous => do not block
+    // ─────────────────────────────────────────────────────────────
+    // Domaine inconnu / nouveau client possible : on ne bloque pas.
+    // On retourne éventuellement une raison pour faciliter la revue.
+    const ambiguous = Math.abs(offerScore - requestScore) <= 1 && (offerScore >= 3 || requestScore >= 3);
+    if (ambiguous) {
+      return { isSupplierQuote: false, reason: 'Ambigu, revue manuelle recommandée' };
+    }
+
+    // Par défaut: ne pas bloquer
     return { isSupplierQuote: false };
+  }
+
+  /**
+   * Détermine si le fallback LLM doit être activé
+   * @param itemCount Nombre d'items extraits par regex
+   * @param needsManualReview Flag de révision manuelle
+   * @returns true si LLM doit être utilisé
+   */
+  private shouldTriggerLlmFallback(itemCount: number, needsManualReview: boolean): boolean {
+    switch (this.llmMode) {
+      case 'always':
+        // Toujours utiliser LLM (pour tests)
+        return true;
+
+      case 'auto':
+        // LLM si peu d'items ou extraction incertaine
+        return itemCount < this.llmMinItemsThreshold || needsManualReview;
+
+      case 'fallback':
+        // LLM seulement si aucun item
+        return itemCount === 0;
+
+      case 'off':
+      default:
+        return false;
+    }
   }
 }

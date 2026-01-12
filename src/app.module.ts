@@ -18,6 +18,7 @@ import { TrackingModule } from './tracking/tracking.module';
 import { WebhookModule } from './webhook/webhook.module';
 import { RfqLifecycleModule } from './rfq-lifecycle/rfq-lifecycle.module';
 import { BrandIntelligenceModule } from './brand-intelligence/brand-intelligence.module';
+import { LlmModule } from './llm';
 import { AppController } from './app.controller';
 
 @Module({
@@ -49,6 +50,7 @@ import { AppController } from './app.controller';
     AcknowledgmentModule,
     TrackingModule,
     RfqLifecycleModule,
+    LlmModule,
   ],
   controllers: [AppController],
 })

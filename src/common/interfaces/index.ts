@@ -49,6 +49,11 @@ export interface PriceRequestItem {
   needsManualReview?: boolean;  // true si quantité/infos à vérifier manuellement
   isEstimated?: boolean;        // true si quantité estimée (non lue du document)
   originalLine?: number;        // Numéro de ligne dans le document original
+  // LLM Parser fields
+  unitPrice?: number;           // Prix unitaire
+  totalPrice?: number;          // Prix total ligne
+  currency?: string;            // Devise (USD, EUR, XOF)
+  needsReview?: boolean;        // Alias pour needsManualReview (LLM compatibility)
 }
 
 /**
@@ -164,4 +169,20 @@ export interface AppConfig {
   autoSendToProcurement: boolean;     // true
   readEndDate?: Date;                 // Date limite de lecture des emails
   requireManualReviewForOcr: boolean; // true = bloquer envoi auto si OCR
+}
+
+/**
+ * Données extraites d'un document (format unifié LLM Parser)
+ */
+export interface ExtractedDocumentData {
+  filename: string;
+  type: 'pdf' | 'excel' | 'word' | 'email' | 'image';
+  text: string;
+  items: PriceRequestItem[];
+  rfqNumber?: string;
+  needsVerification?: boolean;
+  extractionMethod?: string;
+  deadline?: string;
+  contactName?: string;
+  isUrgent?: boolean;
 }
