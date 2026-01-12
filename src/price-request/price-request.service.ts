@@ -81,6 +81,17 @@ export class PriceRequestService {
 
   async processEmail(email: ParsedEmail, supplierEmail?: string): Promise<ProcessEmailResult> {
     try {
+      // Vérifier si c'est une offre fournisseur (pas une demande de prix)
+      const quoteCheck = this.isLikelySupplierQuote(email);
+      if (quoteCheck.isQuote) {
+        this.logger.warn(`Email filtré comme offre fournisseur: ${quoteCheck.reason}`);
+        return {
+          success: false,
+          email,
+          error: `Offre fournisseur détectée (pas une demande de prix): ${quoteCheck.reason}`,
+        };
+      }
+
       // Séparer les pièces jointes par type
       const pdfAttachments = email.attachments.filter(
         (att) => att.contentType === 'application/pdf' || att.filename?.toLowerCase().endsWith('.pdf'),
@@ -592,6 +603,54 @@ export class PriceRequestService {
       extractedItems: extractedData.flatMap((d) => d.items),
       totalItems: extractedData.reduce((sum, d) => sum + d.items.length, 0),
     };
+  }
+
+  /**
+   * Détecte si l'email est probablement une offre fournisseur (pas une demande de prix)
+   * Version simplifiée pour filtrer les cas évidents
+   */
+  private isLikelySupplierQuote(email: ParsedEmail): { isQuote: boolean; reason?: string } {
+    const subject = (email.subject || '').toLowerCase();
+    const body = (email.body || '').substring(0, 3000).toLowerCase();
+
+    // Patterns d'offres dans les noms de fichiers
+    const offerFilePatterns = /(quotation|quote|offer|proforma|invoice|devis|cotation|proposition|offre|facture)/i;
+
+    for (const att of email.attachments || []) {
+      const fn = (att.filename || '').toLowerCase();
+      if (offerFilePatterns.test(fn)) {
+        // Vérifier que ce n'est pas une "demande de" dans le nom
+        if (!fn.includes('demande') && !fn.includes('request')) {
+          return { isQuote: true, reason: `Fichier "${att.filename}" indique une offre/devis` };
+        }
+      }
+    }
+
+    // Patterns d'offres dans le sujet
+    const offerSubjectPatterns = [
+      'notre offre', 'our offer', 'our quotation', 'notre devis',
+      'proposition commerciale', 'offre de prix', 'proforma', 'invoice',
+    ];
+    for (const pattern of offerSubjectPatterns) {
+      if (subject.includes(pattern)) {
+        return { isQuote: true, reason: `Sujet contient "${pattern}"` };
+      }
+    }
+
+    // Patterns de structure devis dans le corps
+    const hasBank = /\b(iban|swift|rib|coordonnees bancaires|coordonnées bancaires)\b/i.test(body);
+    const hasTotals = /\b(total ht|total ttc|montant ttc|grand total|subtotal)\b/i.test(body);
+    const hasValidity = /\b(valid until|validity|validite|validité)\b/i.test(body);
+
+    if (hasBank && hasTotals) {
+      return { isQuote: true, reason: 'Structure devis détectée (coordonnées bancaires + totaux)' };
+    }
+
+    if (hasTotals && hasValidity) {
+      return { isQuote: true, reason: 'Structure devis détectée (totaux + validité)' };
+    }
+
+    return { isQuote: false };
   }
 
   /**

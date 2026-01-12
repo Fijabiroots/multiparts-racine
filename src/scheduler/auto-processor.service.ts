@@ -1126,7 +1126,7 @@ Pour toute correspondance, veuillez utiliser la référence : ${rfqNumber}`;
     for (const att of email.attachments || []) {
       const fn = (att.filename || '').toLowerCase();
       // Offres/devis fréquents en PJ
-      if (/(quotation|quote|offer|proforma|invoice|devis|cotation|inv[-_]|pi[-_]|qt[-_])/i.test(fn)) {
+      if (/(quotation|quote|offer|proforma|invoice|devis|cotation|proposition|offre|inv[-_]|pi[-_]|qt[-_])/i.test(fn)) {
         offerScore += 2;
       }
     }
