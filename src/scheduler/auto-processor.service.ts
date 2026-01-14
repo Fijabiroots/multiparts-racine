@@ -1192,6 +1192,30 @@ Pour toute correspondance, veuillez utiliser la référence : ${rfqNumber}`;
 
     const senderEmail = this.extractEmail(from);
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // 0) EARLY ESCAPE: Explicit RFQ patterns in body override supplier detection
+    // Ces patterns indiquent clairement une DEMANDE de prix, pas une offre
+    // ═══════════════════════════════════════════════════════════════════════
+    const explicitRfqBodyPatterns = [
+      // Phrases françaises explicites de demande
+      /\bpri[èe]re\s+(?:de\s+)?(?:nous\s+)?(?:fournir|transmettre|envoyer|faire\s+parvenir)/i,
+      /\b(?:votre|meilleure?|une)\s+offre\s+de\s+prix\b/i,
+      /\boffre\s+de\s+prix[,\s]+(?:qualité|délai)/i,
+      /\bmerci\s+de\s+(?:nous\s+)?(?:fournir|transmettre|coter|chiffrer)/i,
+      /\bpour\s+les\s+(?:articles?|pièces?|produits?)\s+(?:suivants?|ci-(?:dessous|après))/i,
+      /\bdemande\s+de\s+(?:prix|cotation|devis)\b/i,
+      // Phrases anglaises explicites
+      /\bplease\s+(?:quote|provide\s+(?:us\s+)?(?:with\s+)?(?:your\s+)?(?:best\s+)?(?:price|quotation))/i,
+      /\bkindly\s+(?:quote|provide|send)\s+(?:us\s+)?(?:your\s+)?(?:best\s+)?(?:price|quotation)/i,
+      /\brequest(?:ing)?\s+(?:for\s+)?(?:your\s+)?(?:best\s+)?(?:price|quotation|quote)/i,
+    ];
+
+    for (const pattern of explicitRfqBodyPatterns) {
+      if (pattern.test(bodyWindow)) {
+        return { isSupplierQuote: false, reason: 'Pattern RFQ explicite dans le corps' };
+      }
+    }
+
     // ─────────────────────────────────────────────────────────────
     // 1) Thread rules (RE/FW/TR) + références internes
     // ─────────────────────────────────────────────────────────────

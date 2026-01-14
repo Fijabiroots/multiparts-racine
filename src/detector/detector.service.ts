@@ -54,18 +54,50 @@ export class DetectorService implements OnModuleInit {
     const bodyLower = email.body.toLowerCase();
 
     // ═══════════════════════════════════════════════════════════════════════
-    // EXCLUSION: Bons de commande / Purchase Orders
+    // EARLY CHECK: Patterns RFQ explicites dans le corps
+    // Ces patterns indiquent clairement une DEMANDE de prix et doivent
+    // OVERRIDER l'exclusion PO (ex: instructions Holcim avec "bon de commande")
     // ═══════════════════════════════════════════════════════════════════════
-    const poExclusion = this.checkPurchaseOrderExclusion(subjectLower, bodyLower);
-    if (poExclusion.isPurchaseOrder) {
-      return {
-        isPriceRequest: false,
-        confidence: 0,
-        matchedKeywords: [],
-        hasRelevantAttachments: false,
-        attachmentTypes: [],
-        reason: `Exclu: ${poExclusion.reason}`,
-      };
+    const explicitRfqBodyPatterns = [
+      // Phrases françaises explicites de demande
+      /\bpri[èe]re\s+(?:de\s+)?(?:nous\s+)?(?:fournir|transmettre|envoyer|faire\s+parvenir)/i,
+      /\b(?:votre|meilleure?|une)\s+offre\s+de\s+prix\b/i,
+      /\boffre\s+de\s+prix[,\s]+(?:qualité|délai)/i,
+      /\bmerci\s+de\s+(?:nous\s+)?(?:fournir|transmettre|coter|chiffrer)/i,
+      /\bdemande\s+de\s+(?:prix|cotation|devis)\b/i,
+      /\bveuillez\s+(?:nous\s+)?(?:fournir|transmettre|coter|chiffrer)/i,
+      // Phrases anglaises explicites
+      /\bplease\s+(?:quote|provide\s+(?:us\s+)?(?:with\s+)?(?:your\s+)?(?:best\s+)?(?:price|quotation))/i,
+      /\bkindly\s+(?:quote|provide|send)\s+(?:us\s+)?(?:your\s+)?(?:best\s+)?(?:price|quotation)/i,
+      /\brequest(?:ing)?\s+(?:for\s+)?(?:your\s+)?(?:best\s+)?(?:price|quotation|quote)/i,
+    ];
+
+    let hasExplicitRfqInBody = false;
+    let rfqBodyPattern = '';
+    for (const pattern of explicitRfqBodyPatterns) {
+      if (pattern.test(bodyLower)) {
+        hasExplicitRfqInBody = true;
+        rfqBodyPattern = pattern.source;
+        break;
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // EXCLUSION: Bons de commande / Purchase Orders
+    // SEULEMENT si pas de pattern RFQ explicite dans le corps
+    // ═══════════════════════════════════════════════════════════════════════
+    if (!hasExplicitRfqInBody) {
+      const poExclusion = this.checkPurchaseOrderExclusion(subjectLower, bodyLower);
+      if (poExclusion.isPurchaseOrder) {
+        return {
+          isPriceRequest: false,
+          confidence: 0,
+          matchedKeywords: [],
+          hasRelevantAttachments: false,
+          attachmentTypes: [],
+          reason: `Exclu: ${poExclusion.reason}`,
+        };
+      }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
