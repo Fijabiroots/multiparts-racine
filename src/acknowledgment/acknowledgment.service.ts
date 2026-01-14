@@ -23,7 +23,7 @@ export interface AcknowledgmentData {
   isUrgent?: boolean;
   // Pour le threading (réponse liée)
   originalMessageId?: string;
-  originalReferences?: string;
+  originalReferences?: string[];  // Liste des Message-IDs de la chaîne de threading
 }
 
 @Injectable()
@@ -338,10 +338,10 @@ Email: <a href="mailto:${c.primaryEmail}">${c.primaryEmail}</a>
       // Ces headers font que l'email apparaît comme une RÉPONSE liée
       if (data.originalMessageId) {
         mailOptions.inReplyTo = data.originalMessageId;
-        
-        // References inclut le Message-ID original + les références précédentes
-        if (data.originalReferences) {
-          mailOptions.references = `${data.originalReferences} ${data.originalMessageId}`;
+
+        // References inclut les références précédentes + le Message-ID original
+        if (data.originalReferences && data.originalReferences.length > 0) {
+          mailOptions.references = [...data.originalReferences, data.originalMessageId].join(' ');
         } else {
           mailOptions.references = data.originalMessageId;
         }

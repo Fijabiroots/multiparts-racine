@@ -646,6 +646,42 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     return this.mapRowToRfqMapping(result[0].columns, result[0].values[0]);
   }
 
+  // Chercher un RFQ par pattern partiel sur le numéro client (pour détecter les variantes PR-xxx, PR xxx, etc.)
+  async findRfqByClientRfqPattern(rfqNumber: string): Promise<RfqMapping | null> {
+    if (!rfqNumber || rfqNumber.length < 5) return null;
+
+    // Chercher avec LIKE pour les numéros partiels
+    const searchPattern = `%${rfqNumber}%`;
+
+    const result = this.db.exec(`
+      SELECT * FROM rfq_mappings
+      WHERE client_rfq_number LIKE ?
+      ORDER BY received_at DESC
+      LIMIT 1
+    `, [searchPattern]);
+
+    if (result.length === 0 || result[0].values.length === 0) return null;
+    return this.mapRowToRfqMapping(result[0].columns, result[0].values[0]);
+  }
+
+  // Chercher un RFQ par sujet similaire SANS vérification d'expéditeur (pour les transferts)
+  async findRfqBySubjectPattern(cleanSubject: string): Promise<RfqMapping | null> {
+    if (!cleanSubject || cleanSubject.length < 20) return null;
+
+    // Utiliser une portion significative du sujet pour la recherche
+    const searchPattern = `%${cleanSubject.substring(0, Math.min(40, cleanSubject.length))}%`;
+
+    const result = this.db.exec(`
+      SELECT * FROM rfq_mappings
+      WHERE LOWER(email_subject) LIKE ?
+      ORDER BY received_at DESC
+      LIMIT 1
+    `, [searchPattern]);
+
+    if (result.length === 0 || result[0].values.length === 0) return null;
+    return this.mapRowToRfqMapping(result[0].columns, result[0].values[0]);
+  }
+
   // ============ PENDING DRAFTS (Brouillons en attente) ============
 
   async createPendingDraft(draft: {

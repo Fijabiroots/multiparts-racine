@@ -12,7 +12,8 @@ export interface ParsedEmail {
   to: string | string[];     // Peut être string ou array
   cc?: string[];             // Destinataires en copie
   replyTo?: string;          // Reply-To header
-  references?: string;       // References header pour le threading
+  inReplyTo?: string;        // In-Reply-To header (réponse directe)
+  references?: string[];     // References header pour le threading (chaîne de messages)
   subject: string;
   date: Date;
   body: string;

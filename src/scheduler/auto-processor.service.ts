@@ -147,6 +147,29 @@ export class AutoProcessorService {
             continue;
           }
 
+          // NOUVEAU: Vérifier si expéditeur interne (emails @multipartsci.com)
+          const senderEmail = this.extractEmail(email.from).toLowerCase();
+          const internalDomains = ['multipartsci.com', 'multiparts.ci'];
+          const isInternalSender = internalDomains.some(domain => senderEmail.endsWith(`@${domain}`));
+
+          if (isInternalSender) {
+            result.skipped++;
+            result.details.push({
+              emailId: email.id,
+              subject: email.subject,
+              status: 'skipped',
+              error: `Expéditeur interne ignoré: ${senderEmail}`,
+            });
+
+            await this.databaseService.addProcessingLog({
+              emailId: email.id,
+              action: 'filter',
+              status: 'skipped',
+              message: `Expéditeur interne: ${senderEmail}`,
+            });
+            continue;
+          }
+
           // Vérifier si déjà traité (par UID IMAP ou Message-ID pour cross-mailbox)
           const isProcessedByUid = await this.databaseService.isEmailProcessed(email.id);
           const isProcessedByMessageId = email.messageId
@@ -1434,33 +1457,59 @@ Pour toute correspondance, veuillez utiliser la référence : ${rfqNumber}`;
       .trim()
       .toLowerCase();
 
-    // 3) Chercher un RFQ client dans le sujet
+    // 3) Chercher un RFQ client dans le sujet - extraire le NUMÉRO uniquement
     const clientRfqPatterns = [
-      /pr[\s_-]?(\d{6,})/i,                    // PR 11129020
-      /rfq[\s_-]?([a-z0-9\-_]+)/i,             // RFQ-xxx
-      /da[\s_-]?(\d{4}[\/-]\d+)/i,             // DA2025-175
-      /bi[\s_-]?(\d+)/i,                       // BI 740
-      /pr[\s_-]?(\d+[\/-]\d+)/i,               // PR-687 or PR_2619
+      { pattern: /pr[\s_-]?(\d{6,})/i, type: 'PR' },                // PR 11129020 -> 11129020
+      { pattern: /rfq[\s_-]?([a-z0-9\-_]+)/i, type: 'RFQ' },        // RFQ-xxx
+      { pattern: /da[\s_-]?(\d{4}[\/-]\d+)/i, type: 'DA' },         // DA2025-175
+      { pattern: /bi[\s_-]?(\d+)/i, type: 'BI' },                   // BI 740
+      { pattern: /po[\s_-]?(\d{6,})/i, type: 'PO' },                // PO 1516782
     ];
 
     let extractedClientRfq: string | undefined;
-    for (const pattern of clientRfqPatterns) {
+    let extractedNumber: string | undefined;
+    for (const { pattern, type } of clientRfqPatterns) {
       const match = (email.subject || '').match(pattern);
       if (match) {
         extractedClientRfq = match[0].toUpperCase().replace(/[\s_]/g, '-');
+        extractedNumber = match[1]; // Le groupe capturé (numéro uniquement)
         break;
       }
     }
 
     // 4) Si on a un RFQ client, vérifier s'il existe déjà en BDD
-    if (extractedClientRfq) {
-      const existingMapping = await this.databaseService.getRfqMappingByClientRfq(extractedClientRfq);
-      if (existingMapping) {
-        return {
-          isRelance: true,
-          existingRfqNumber: existingMapping.internalRfqNumber,
-          reason: `Relance détectée: RFQ client ${extractedClientRfq} déjà traité comme ${existingMapping.internalRfqNumber}`,
-        };
+    // Essayer plusieurs formats: avec et sans préfixe
+    if (extractedClientRfq || extractedNumber) {
+      const searchVariants = [
+        extractedClientRfq,
+        extractedNumber,
+        // Variantes supplémentaires
+        extractedNumber ? `PR-${extractedNumber}` : null,
+        extractedNumber ? `PR ${extractedNumber}` : null,
+        extractedNumber ? extractedNumber.replace(/-/g, '') : null,
+      ].filter(Boolean) as string[];
+
+      for (const variant of searchVariants) {
+        const existingMapping = await this.databaseService.getRfqMappingByClientRfq(variant);
+        if (existingMapping) {
+          return {
+            isRelance: true,
+            existingRfqNumber: existingMapping.internalRfqNumber,
+            reason: `Relance détectée: RFQ client ${extractedClientRfq} déjà traité comme ${existingMapping.internalRfqNumber}`,
+          };
+        }
+      }
+
+      // Aussi chercher par LIKE dans la BDD pour plus de flexibilité
+      if (extractedNumber && extractedNumber.length >= 5) {
+        const existingByPartialMatch = await this.databaseService.findRfqByClientRfqPattern(extractedNumber);
+        if (existingByPartialMatch) {
+          return {
+            isRelance: true,
+            existingRfqNumber: existingByPartialMatch.internalRfqNumber,
+            reason: `Relance détectée: RFQ client ${extractedNumber} correspond à ${existingByPartialMatch.internalRfqNumber}`,
+          };
+        }
       }
     }
 
@@ -1479,17 +1528,32 @@ Pour toute correspondance, veuillez utiliser la référence : ${rfqNumber}`;
       }
     }
 
-    // 6) Vérifier les headers de thread (References, In-Reply-To)
-    if (email.references && email.references.length > 0) {
-      for (const refMessageId of email.references) {
-        const existingByRef = await this.databaseService.getRfqMappingByMessageId(refMessageId);
-        if (existingByRef) {
-          return {
-            isRelance: true,
-            existingRfqNumber: existingByRef.internalRfqNumber,
-            reason: `Relance détectée: réponse à un thread existant (${existingByRef.internalRfqNumber})`,
-          };
-        }
+    // 6) Chercher par sujet similaire SANS vérification d'expéditeur (pour les transferts)
+    if (isRelanceSubject && cleanSubject.length > 20) {
+      const existingBySubjectOnly = await this.databaseService.findRfqBySubjectPattern(cleanSubject);
+      if (existingBySubjectOnly) {
+        return {
+          isRelance: true,
+          existingRfqNumber: existingBySubjectOnly.internalRfqNumber,
+          reason: `Relance détectée: sujet similaire (transfert) ${existingBySubjectOnly.internalRfqNumber}`,
+        };
+      }
+    }
+
+    // 7) Vérifier les headers de thread (References, In-Reply-To)
+    const messageIdsToCheck = [
+      ...(email.references || []),
+      email.inReplyTo,
+    ].filter(Boolean) as string[];
+
+    for (const refMessageId of messageIdsToCheck) {
+      const existingByRef = await this.databaseService.getRfqMappingByMessageId(refMessageId);
+      if (existingByRef) {
+        return {
+          isRelance: true,
+          existingRfqNumber: existingByRef.internalRfqNumber,
+          reason: `Relance détectée: réponse à un thread existant (${existingByRef.internalRfqNumber})`,
+        };
       }
     }
 
