@@ -82,6 +82,91 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     try {
       this.db.run(`CREATE INDEX IF NOT EXISTS idx_rfq_message_id ON rfq_mappings(message_id)`);
     } catch (e) { /* index exists */ }
+
+    // Migration: Supplier Collector tables
+    this.createSupplierCollectorTables();
+  }
+
+  /**
+   * Crée les tables pour le module Supplier Collector (migration)
+   */
+  private createSupplierCollectorTables() {
+    // Table des emails analysés
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS supplier_emails (
+        id TEXT PRIMARY KEY,
+        message_id TEXT NOT NULL,
+        account_email TEXT NOT NULL,
+        folder TEXT NOT NULL,
+        from_email TEXT NOT NULL,
+        from_name TEXT,
+        to_emails TEXT,
+        subject TEXT NOT NULL,
+        date TEXT NOT NULL,
+        body_snippet TEXT,
+        attachment_count INTEGER DEFAULT 0,
+        attachment_names TEXT,
+        classification TEXT NOT NULL DEFAULT 'UNPROCESSED',
+        classification_score INTEGER DEFAULT 0,
+        classification_reasons TEXT,
+        processed_at TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE(account_email, message_id)
+      )
+    `);
+
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_supplier_emails_account ON supplier_emails(account_email)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_supplier_emails_from ON supplier_emails(from_email)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_supplier_emails_classification ON supplier_emails(classification)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_supplier_emails_date ON supplier_emails(date)`);
+
+    // Table annuaire Marque → Fournisseurs
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS brand_supplier_mapping (
+        id TEXT PRIMARY KEY,
+        brand_name TEXT NOT NULL,
+        category TEXT,
+        supplier_email TEXT NOT NULL,
+        supplier_name TEXT,
+        confidence REAL DEFAULT 0.5,
+        offer_count INTEGER DEFAULT 1,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        evidence_message_id TEXT,
+        evidence_reasons TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(brand_name, supplier_email)
+      )
+    `);
+
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_brand_supplier_brand ON brand_supplier_mapping(brand_name)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_brand_supplier_email ON brand_supplier_mapping(supplier_email)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_brand_supplier_confidence ON brand_supplier_mapping(confidence)`);
+
+    // Table logs de sync
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS supplier_sync_logs (
+        id TEXT PRIMARY KEY,
+        account_email TEXT NOT NULL,
+        folder TEXT NOT NULL,
+        sync_type TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        messages_found INTEGER DEFAULT 0,
+        messages_new INTEGER DEFAULT 0,
+        messages_skipped INTEGER DEFAULT 0,
+        offers_detected INTEGER DEFAULT 0,
+        brands_matched INTEGER DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'running',
+        error_message TEXT
+      )
+    `);
+
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_supplier_sync_account ON supplier_sync_logs(account_email)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_supplier_sync_status ON supplier_sync_logs(status)`);
+
+    this.logger.log('Migration: Supplier Collector tables créées');
   }
 
   private createTables() {
@@ -271,6 +356,83 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
 
     this.db.run(`CREATE INDEX IF NOT EXISTS idx_supplier_email ON known_suppliers(email)`);
     this.db.run(`CREATE INDEX IF NOT EXISTS idx_supplier_domain ON known_suppliers(email_domain)`);
+
+    // ============ SUPPLIER COLLECTOR TABLES ============
+
+    // Table des emails analysés pour la collecte fournisseurs
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS supplier_emails (
+        id TEXT PRIMARY KEY,
+        message_id TEXT NOT NULL,
+        account_email TEXT NOT NULL,
+        folder TEXT NOT NULL,
+        from_email TEXT NOT NULL,
+        from_name TEXT,
+        to_emails TEXT,
+        subject TEXT NOT NULL,
+        date TEXT NOT NULL,
+        body_snippet TEXT,
+        attachment_count INTEGER DEFAULT 0,
+        attachment_names TEXT,
+        classification TEXT NOT NULL DEFAULT 'UNPROCESSED',
+        classification_score INTEGER DEFAULT 0,
+        classification_reasons TEXT,
+        processed_at TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE(account_email, message_id)
+      )
+    `);
+
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_supplier_emails_account ON supplier_emails(account_email)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_supplier_emails_from ON supplier_emails(from_email)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_supplier_emails_classification ON supplier_emails(classification)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_supplier_emails_date ON supplier_emails(date)`);
+
+    // Table de l'annuaire Marque → Fournisseurs
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS brand_supplier_mapping (
+        id TEXT PRIMARY KEY,
+        brand_name TEXT NOT NULL,
+        category TEXT,
+        supplier_email TEXT NOT NULL,
+        supplier_name TEXT,
+        confidence REAL DEFAULT 0.5,
+        offer_count INTEGER DEFAULT 1,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        evidence_message_id TEXT,
+        evidence_reasons TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(brand_name, supplier_email)
+      )
+    `);
+
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_brand_supplier_brand ON brand_supplier_mapping(brand_name)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_brand_supplier_email ON brand_supplier_mapping(supplier_email)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_brand_supplier_confidence ON brand_supplier_mapping(confidence)`);
+
+    // Table des logs de synchronisation fournisseurs
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS supplier_sync_logs (
+        id TEXT PRIMARY KEY,
+        account_email TEXT NOT NULL,
+        folder TEXT NOT NULL,
+        sync_type TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        messages_found INTEGER DEFAULT 0,
+        messages_new INTEGER DEFAULT 0,
+        messages_skipped INTEGER DEFAULT 0,
+        offers_detected INTEGER DEFAULT 0,
+        brands_matched INTEGER DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'running',
+        error_message TEXT
+      )
+    `);
+
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_supplier_sync_account ON supplier_sync_logs(account_email)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_supplier_sync_status ON supplier_sync_logs(status)`);
 
     this.logger.log('Tables créées');
   }

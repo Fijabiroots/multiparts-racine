@@ -1,4 +1,4 @@
-import { Injectable, Logger, Inject, forwardRef } from '@nestjs/common';
+import { Injectable, Logger, Inject, forwardRef, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as imapSimple from 'imap-simple';
 import * as nodemailer from 'nodemailer';
@@ -7,6 +7,7 @@ import { COMPANY_INFO, getCompanyHeader, getAddressBlock } from '../common/compa
 import { RfqLanguage, getRfqInstructions, detectLanguageFromEmail, detectLanguageFromText } from '../common/rfq-instructions';
 import { BrandIntelligenceService } from '../brand-intelligence/brand-intelligence.service';
 import { BrandAnalysisResult, SupplierSuggestion } from '../brand-intelligence/brand.interface';
+import { SupplierDirectoryService } from '../supplier-collector/services/supplier-directory.service';
 
 interface DraftEmailOptions {
   to: string;
@@ -52,6 +53,8 @@ export class DraftService {
     private configService: ConfigService,
     @Inject(forwardRef(() => BrandIntelligenceService))
     private brandIntelligence: BrandIntelligenceService,
+    @Optional()
+    private supplierDirectory?: SupplierDirectoryService,
   ) {}
 
   private getImapConfig(): imapSimple.ImapSimpleOptions {
@@ -373,10 +376,29 @@ Notification générée automatiquement par le système RFQ.`;
 
       this.logger.log(`🏷️ Marques détectées: ${brandAnalysis.detectedBrands.join(', ') || 'aucune'}`);
       
-      // Ajouter automatiquement les fournisseurs suggérés en BCC
+      // Ajouter automatiquement les fournisseurs suggérés en BCC (depuis BrandIntelligence)
       if (options.autoAddSuppliers !== false && brandAnalysis.autoSendEmails.length > 0) {
         bccSuppliers = [...new Set([...bccSuppliers, ...brandAnalysis.autoSendEmails])];
-        this.logger.log(`📧 ${bccSuppliers.length} fournisseur(s) ajouté(s) en BCC automatiquement`);
+        this.logger.log(`📧 ${bccSuppliers.length} fournisseur(s) ajouté(s) en BCC (BrandIntelligence)`);
+      }
+
+      // Ajouter les fournisseurs collectés dynamiquement (depuis SupplierDirectory)
+      if (options.autoAddSuppliers !== false && this.supplierDirectory && brandAnalysis.detectedBrands.length > 0) {
+        try {
+          const collectedEmails = await this.supplierDirectory.getUniqueSupplierEmailsForBrands(
+            brandAnalysis.detectedBrands
+          );
+          if (collectedEmails.length > 0) {
+            const beforeCount = bccSuppliers.length;
+            bccSuppliers = [...new Set([...bccSuppliers, ...collectedEmails])];
+            const addedCount = bccSuppliers.length - beforeCount;
+            if (addedCount > 0) {
+              this.logger.log(`📧 ${addedCount} fournisseur(s) ajouté(s) en BCC (SupplierCollector)`);
+            }
+          }
+        } catch (err) {
+          this.logger.warn(`Erreur récupération fournisseurs collectés: ${err.message}`);
+        }
       }
 
       // Ajouter les nouvelles marques détectées

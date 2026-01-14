@@ -20,6 +20,7 @@ import { RfqLifecycleModule } from './rfq-lifecycle/rfq-lifecycle.module';
 import { BrandIntelligenceModule } from './brand-intelligence/brand-intelligence.module';
 import { LlmModule } from './llm';
 import { ReminderModule } from './reminder/reminder.module';
+import { SupplierCollectorModule } from './supplier-collector/supplier-collector.module';
 import { AppController } from './app.controller';
 
 @Module({
@@ -53,6 +54,7 @@ import { AppController } from './app.controller';
     RfqLifecycleModule,
     LlmModule,
     ReminderModule,
+    SupplierCollectorModule,
   ],
   controllers: [AppController],
 })
