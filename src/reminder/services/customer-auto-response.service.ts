@@ -235,7 +235,7 @@ export class CustomerAutoResponseService {
     const senderEmail = this.linkerService.extractEmail(email.from);
 
     const subject = `Re: ${email.subject}`;
-    const body = this.buildAckBody(requestContext);
+    const body = this.buildAckBody(requestContext, email.subject);
 
     try {
       const result = await this.mailService.sendAutoEmail({
@@ -310,13 +310,30 @@ export class CustomerAutoResponseService {
 
   /**
    * Build ACK email body
+   * Includes client RFQ number if available, otherwise uses email subject
    */
-  private buildAckBody(requestContext: RequestContext): string {
+  private buildAckBody(requestContext: RequestContext, emailSubject?: string): string {
+    // Determine the client reference to display
+    let clientReference = '';
+    if (requestContext.clientRfqNumber) {
+      clientReference = `\nVotre référence : ${requestContext.clientRfqNumber}`;
+    } else if (emailSubject) {
+      // Clean subject: remove Re:, Fwd:, etc.
+      const cleanSubject = emailSubject
+        .replace(/^(re|fwd|fw|tr):\s*/gi, '')
+        .trim();
+      if (cleanSubject) {
+        clientReference = `\nObjet : ${cleanSubject}`;
+      }
+    }
+
     return `Bonjour,
 
 Nous accusons bonne réception de votre demande.
 
-Votre demande (Réf. interne : ${requestContext.internalRfqNumber}) est en cours de traitement par nos équipes.
+Réf. interne : ${requestContext.internalRfqNumber}${clientReference}
+
+Votre demande est en cours de traitement par nos équipes.
 Nous revenons vers vous dans les meilleurs délais avec une proposition.
 
 Cordialement,
@@ -326,10 +343,16 @@ MULTIPARTS – Rafiou OYEOSSI`;
   /**
    * Build chaser auto-reply body
    */
-  private buildChaserReplyBody(requestContext: RequestContext): string {
+  private buildChaserReplyBody(requestContext: RequestContext, emailSubject?: string): string {
+    // Determine the client reference to display
+    let clientReference = '';
+    if (requestContext.clientRfqNumber) {
+      clientReference = ` / Votre réf. : ${requestContext.clientRfqNumber}`;
+    }
+
     return `Bonjour,
 
-Merci pour votre relance. Votre demande (Réf. ${requestContext.internalRfqNumber}) est toujours en cours de traitement par nos équipes.
+Merci pour votre relance. Votre demande (Réf. ${requestContext.internalRfqNumber}${clientReference}) est toujours en cours de traitement par nos équipes.
 
 Nous revenons vers vous dès que possible avec une mise à jour.
 

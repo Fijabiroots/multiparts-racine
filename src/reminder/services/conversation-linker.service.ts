@@ -353,6 +353,7 @@ export class ConversationLinkerService {
       rfqId: mapping.id,
       internalRfqNumber: mapping.internalRfqNumber,
       clientRfqNumber: mapping.clientRfqNumber,
+      emailSubject: mapping.emailSubject,
       customerEmail,
       customerDomain,
       status: statusMap[mapping.status] || 'PENDING',

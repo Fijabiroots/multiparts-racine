@@ -68,6 +68,7 @@ export interface RequestContext {
   rfqId?: string;
   internalRfqNumber: string;
   clientRfqNumber?: string;
+  emailSubject?: string;           // Sujet de l'email original
   customerEmail: string;
   customerDomain: string;
   status: RequestStatus;
