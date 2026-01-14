@@ -301,6 +301,18 @@ const NOISE_PATTERNS = [
   // Noms de personnes (pattern: Prénom NOM ou NOM Prénom)
   /^[A-Z][a-z]+\s+[A-Z]{2,}$/,  // Jean DUPONT
   /^[A-Z]{2,}\s+[A-Z][a-z]+$/,  // DUPONT Jean
+  // Note: Le pattern tout-majuscules ^[A-Z]{2,}\s+[A-Z]{2,}$ est trop large (attrape POMPE HYDRAULIQUE)
+  // On le gère via la détection heuristique avec exclusion des mots techniques
+  // Titres de fonction (job titles) - patterns courants
+  /^(DIRECTEUR|DIRECTOR|MANAGER|ADJOINT|RESPONSABLE|CHEF|PRESIDENT|GERANT|ASSISTANT|DEPUTY|HEAD|SUPERVISOR|COORDINAT)/i,
+  /\b(DIRECTEUR|DIRECTOR|MANAGER)\s*(ADJOINT|GENERAL|TECHNIQUE|COMMERCIAL|REGIONAL)?\s*$/i,
+  // Métadonnées email avec astérisques (ex: "*ENVOYÉ :*")
+  /\*ENVOY[ÉE]\s*:?\*?/i,
+  /\*(FROM|TO|CC|DATE|SENT|OBJET)\s*:?\*?/i,
+  /\*[A-ZÉÈÀÙ]+\s*:\*?\s*(LUNDI|MARDI|MERCREDI|JEUDI|VENDREDI|SAMEDI|DIMANCHE|MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY|SUNDAY)/i,
+  // Jours de la semaine en standalone
+  /^(LUNDI|MARDI|MERCREDI|JEUDI|VENDREDI|SAMEDI|DIMANCHE),?\s+(JANVIER|FEVRIER|MARS|AVRIL|MAI|JUIN|JUILLET|AOUT|SEPTEMBRE|OCTOBRE|NOVEMBRE|DECEMBRE)/i,
+  /^(MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY|SUNDAY),?\s+(JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER)/i,
   // Dates standalone
   /^\d{1,2}[-\/](JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[-\/]\d{2,4}$/i,
   /^\d{1,2}[-\/]\d{1,2}[-\/]\d{2,4}$/,
@@ -1810,13 +1822,17 @@ export class TableParserService implements OnModuleInit {
     // Labels avec valeur courte après ":" (ex: "Creation Date: 10-DEC-25")
     if (/^[A-Za-z\s]+:\s*[\d\-\/A-Z]+$/i.test(trimmed) && trimmed.length < 40) return true;
 
-    // Noms de personnes (2-4 mots, chaque mot commence par majuscule)
+    // Noms de personnes (2-4 mots, chaque mot commence par majuscule ou tout en majuscules)
     const words = trimmed.split(/\s+/);
     if (words.length >= 2 && words.length <= 4) {
-      const allCapitalized = words.every(w => /^[A-Z][a-zA-Z]*$/.test(w));
+      // Match "Jean Dupont", "Jean DUPONT", "JEAN DUPONT", "MENAGER MICHAEL"
+      const allCapitalized = words.every(w => /^[A-Z][a-zA-Z]*$/.test(w) || /^[A-Z]+$/.test(w));
       const hasNoNumbers = !/\d/.test(trimmed);
-      const shortWords = words.every(w => w.length <= 15);
-      if (allCapitalized && hasNoNumbers && shortWords && trimmed.length < 40) {
+      const shortWords = words.every(w => w.length >= 2 && w.length <= 15);
+      // Exclure les descriptions de pièces techniques (contiennent des tirets, slashes, ou mots techniques)
+      const technicalWords = /\b(PUMP|POMPE|FILTER|FILTRE|VALVE|MOTOR|MOTEUR|BELT|COURROIE|BEARING|ROULEMENT|GASKET|JOINT|SEAL|CLAMP|RELAY|RELAIS|MUFFLER|SILENCIEUX|EXHAUST|ECHAPPEMENT|HYDRAULIQUE|HYDRAULIC|ELECTRIQUE|ELECTRIC|PNEUMATIC|PNEUMATIQUE|OIL|HUILE|AIR|WATER|EAU|FUEL|CARBURANT|BRAKE|FREIN|GEAR|PIGNON|SHAFT|ARBRE|BUSHING|COUSSINET|SPRING|RESSORT|HOSE|TUYAU|CABLE|SWITCH|INTERRUPTEUR|SENSOR|CAPTEUR|COMPRESSOR|COMPRESSEUR|CYLINDER|CYLINDRE|PISTON|ALTERNATOR|ALTERNATEUR|STARTER|DEMARREUR|RADIATOR|RADIATEUR|THERMOSTAT)\b/i;
+      const looksLikeParts = /[-\/]/.test(trimmed) || technicalWords.test(trimmed);
+      if (allCapitalized && hasNoNumbers && shortWords && trimmed.length < 40 && !looksLikeParts) {
         return true;
       }
     }
