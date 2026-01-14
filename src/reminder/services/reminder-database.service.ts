@@ -172,17 +172,23 @@ export class ReminderDatabaseService implements OnModuleInit {
     requestId: string,
     customerEmail: string,
     messageId?: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const db = (this.databaseService as any).db;
     const now = new Date().toISOString();
 
+    // ATOMIC: Only update if ack_sent_at is NULL to prevent duplicate ACKs
     db.run(`
       UPDATE customer_conversations
       SET ack_sent_at = ?, ack_message_id = ?, updated_at = ?
-      WHERE request_id = ? AND customer_email = ?
+      WHERE request_id = ? AND customer_email = ? AND ack_sent_at IS NULL
     `, [now, messageId || null, now, requestId, customerEmail.toLowerCase()]);
 
+    // Check if update was successful (row was modified)
+    const result = db.exec(`SELECT changes() as changed`);
+    const changed = result.length > 0 && result[0].values.length > 0 ? result[0].values[0][0] : 0;
+
     this.databaseService.saveToFile();
+    return changed > 0;
   }
 
   async updateConversationAutoReply(

@@ -106,31 +106,47 @@ export class CustomerAutoResponseService {
 
     // ============ Linked Request - Check for ACK ============
 
-    // Get conversation record (or create one)
-    let conversation = await this.reminderDbService.getConversationByRequest(
+    // IMPORTANT: Create or update conversation FIRST to ensure record exists
+    // This prevents race conditions where multiple emails trigger duplicate ACKs
+    await this.reminderDbService.createOrUpdateConversation(
+      requestContext.requestId,
+      requestContext.internalRfqNumber,
+      senderEmail,
+      this.linkerService.extractDomain(senderEmail),
+    );
+
+    // Re-fetch conversation to get current state (including ackSentAt)
+    const conversation = await this.reminderDbService.getConversationByRequest(
       requestContext.requestId,
       senderEmail,
     );
 
     // Check if first receipt (no ACK sent yet)
-    if (!conversation || !conversation.ackSentAt) {
+    if (conversation && !conversation.ackSentAt) {
       // Send first receipt ACK
       const ackResult = await this.sendFirstReceiptAck(email, requestContext);
 
       if (ackResult.emailSent) {
-        // Update conversation
-        await this.reminderDbService.updateConversationAck(
+        // ATOMIC: Update conversation with ACK info (returns false if already set by concurrent process)
+        const wasUpdated = await this.reminderDbService.updateConversationAck(
           requestContext.requestId,
           senderEmail,
           ackResult.sentMessageId,
         );
 
-        return {
-          decision: 'SEND_ACK',
-          linkResult,
-          emailSent: true,
-          sentMessageId: ackResult.sentMessageId,
-        };
+        if (wasUpdated) {
+          return {
+            decision: 'SEND_ACK',
+            linkResult,
+            emailSent: true,
+            sentMessageId: ackResult.sentMessageId,
+          };
+        } else {
+          // ACK was already sent by concurrent process - log duplicate attempt
+          this.logger.warn(
+            `Duplicate ACK attempt for ${requestContext.internalRfqNumber} to ${senderEmail} - skipped (race condition)`,
+          );
+        }
       }
     }
 
