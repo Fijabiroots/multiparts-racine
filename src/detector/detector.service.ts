@@ -196,50 +196,94 @@ export class DetectorService implements OnModuleInit {
    * (détection rapide sans calcul de score)
    */
   private checkExplicitRfqPatterns(subject: string, body: string): { isExplicitRfq: boolean; pattern?: string } {
-    // Patterns explicites dans le sujet qui indiquent clairement une RFQ
-    const explicitPatterns = [
-      // "RFQ" seul dans le sujet - terme très spécifique aux demandes de prix
+    // ═══════════════════════════════════════════════════════════════════════
+    // PATTERNS EXPLICITES DANS LE SUJET
+    // ═══════════════════════════════════════════════════════════════════════
+    const subjectPatterns = [
+      // RFQ patterns
       { pattern: /\brfq\b/i, label: 'RFQ' },
-
-      // "RFQ FOR ..." - Pattern très courant
       { pattern: /\brfq\s+for\b/i, label: 'RFQ FOR' },
-      { pattern: /\brfq\s+pr[-\s]?\d+/i, label: 'RFQ PR-xxx' },
-      { pattern: /\brfq\s+#?\d+/i, label: 'RFQ #xxx' },
+      { pattern: /\brfq\s*[-:#]?\s*[a-z0-9]{3,}/i, label: 'RFQ-xxx' },
 
-      // "Request for Quotation" explicite
+      // PR (Purchase Requisition / Price Request) - UNIVERSEL
+      { pattern: /\bpr\s*[-:#]?\s*\d{4,}/i, label: 'PR #xxxxx' },
+      { pattern: /\bpr\s+\d{4,}/i, label: 'PR xxxxx' },
+
+      // Request for Quotation / Quote
       { pattern: /\brequest\s+for\s+quotation\b/i, label: 'Request for Quotation' },
       { pattern: /\brequest\s+for\s+quote\b/i, label: 'Request for Quote' },
+      { pattern: /\bquotation\s+request\b/i, label: 'Quotation Request' },
+      { pattern: /\bprice\s+request\b/i, label: 'Price Request' },
+      { pattern: /\bquote\s+request\b/i, label: 'Quote Request' },
 
-      // Français explicite
+      // Français explicite dans le sujet
       { pattern: /\bdemande\s+de\s+prix\b/i, label: 'Demande de prix' },
       { pattern: /\bdemande\s+de\s+cotation\b/i, label: 'Demande de cotation' },
       { pattern: /\bdemande\s+de\s+devis\b/i, label: 'Demande de devis' },
       { pattern: /\bappel\s+d['']?offres?\b/i, label: 'Appel d\'offres' },
-
-      // Patterns avec numéro de référence
-      { pattern: /\brfq\s*[-:]\s*[a-z0-9]{3,}/i, label: 'RFQ-xxx' },
-      { pattern: /\bquotation\s+request\s+(?:for|#|n[°o])/i, label: 'Quotation Request' },
-      { pattern: /\bprice\s+request\s+(?:for|#|n[°o])/i, label: 'Price Request' },
+      { pattern: /\bcotation\b/i, label: 'Cotation' },
     ];
 
-    // Vérifier d'abord le sujet (plus fiable)
-    for (const { pattern, label } of explicitPatterns) {
+    // Vérifier le sujet
+    for (const { pattern, label } of subjectPatterns) {
       if (pattern.test(subject)) {
-        return { isExplicitRfq: true, pattern: label };
+        return { isExplicitRfq: true, pattern: `[Sujet] ${label}` };
       }
     }
 
-    // Vérifier le corps pour les patterns les plus explicites
+    // ═══════════════════════════════════════════════════════════════════════
+    // PATTERNS UNIVERSELS DANS LE CORPS (phrases de demande de prix)
+    // ═══════════════════════════════════════════════════════════════════════
     const bodyPatterns = [
-      { pattern: /\bplease\s+(?:quote|provide\s+(?:your\s+)?(?:best\s+)?(?:price|quotation))\b/i, label: 'Please quote' },
-      { pattern: /\bkindly\s+(?:quote|send\s+(?:your\s+)?(?:best\s+)?(?:price|quotation))\b/i, label: 'Kindly quote' },
-      { pattern: /\bmerci\s+de\s+(?:nous\s+)?(?:coter|chiffrer|transmettre\s+(?:votre\s+)?(?:meilleur[es]?\s+)?prix)\b/i, label: 'Merci de coter' },
-      { pattern: /\bprière\s+de\s+(?:nous\s+)?faire\s+parvenir\s+(?:votre\s+)?(?:meilleur[es]?\s+)?(?:offre|prix)\b/i, label: 'Prière de faire parvenir' },
+      // ─────────────────────────────────────────────────────────────────────
+      // FRANÇAIS - Phrases de demande de prix universelles
+      // ─────────────────────────────────────────────────────────────────────
+      // "offre de prix" - très explicite
+      { pattern: /\b(?:votre|meilleure?|une)\s+offre\s+de\s+prix\b/i, label: 'Offre de prix' },
+      { pattern: /\boffre\s+de\s+prix[,\s]+(?:qualité|délai)/i, label: 'Offre de prix, qualité, délai' },
+
+      // "prière de" + verbe de demande - UNIVERSEL
+      { pattern: /\bpri[èe]re\s+(?:de\s+)?(?:nous\s+)?(?:fournir|transmettre|envoyer|faire\s+parvenir|communiquer|adresser)/i, label: 'Prière de fournir' },
+
+      // "merci de" + verbe de demande
+      { pattern: /\bmerci\s+de\s+(?:nous\s+)?(?:fournir|transmettre|envoyer|communiquer|coter|chiffrer)/i, label: 'Merci de fournir' },
+
+      // "veuillez" + verbe de demande
+      { pattern: /\bveuillez\s+(?:nous\s+)?(?:fournir|transmettre|envoyer|communiquer|coter|chiffrer)/i, label: 'Veuillez fournir' },
+
+      // Demandes explicites de cotation/devis
+      { pattern: /\bdemande\s+de\s+(?:prix|cotation|devis)\b/i, label: 'Demande de prix/cotation' },
+      { pattern: /\bbesoin\s+(?:d[''])?(?:un\s+)?(?:devis|cotation|prix)\b/i, label: 'Besoin de devis' },
+      { pattern: /\bsouhait(?:ons|e|erions)\s+(?:recevoir|obtenir|avoir)\s+(?:votre\s+)?(?:meilleure?\s+)?(?:offre|prix|cotation|devis)\b/i, label: 'Souhaitons recevoir offre' },
+
+      // Phrases avec "coter" / "chiffrer"
+      { pattern: /\b(?:merci|prière|veuillez)\s+(?:de\s+)?(?:nous\s+)?(?:coter|chiffrer)\b/i, label: 'Coter/Chiffrer' },
+      { pattern: /\bpourriez[- ]vous\s+(?:nous\s+)?(?:coter|chiffrer|fournir)/i, label: 'Pourriez-vous coter' },
+
+      // "pour les articles/pièces suivants" - contexte RFQ
+      { pattern: /\bpour\s+les\s+(?:articles?|pièces?|produits?|éléments?|références?)\s+(?:suivants?|ci-(?:dessous|après|joints?))\b/i, label: 'Pour les articles suivants' },
+
+      // ─────────────────────────────────────────────────────────────────────
+      // ANGLAIS - Universal quote request phrases
+      // ─────────────────────────────────────────────────────────────────────
+      { pattern: /\bplease\s+(?:quote|provide\s+(?:us\s+)?(?:with\s+)?(?:your\s+)?(?:best\s+)?(?:price|quotation|quote))\b/i, label: 'Please quote/provide' },
+      { pattern: /\bkindly\s+(?:quote|provide|send|submit)\s+(?:us\s+)?(?:your\s+)?(?:best\s+)?(?:price|quotation|offer)\b/i, label: 'Kindly quote' },
+      { pattern: /\brequest(?:ing)?\s+(?:for\s+)?(?:your\s+)?(?:best\s+)?(?:price|quotation|quote|offer)\b/i, label: 'Requesting quotation' },
+      { pattern: /\bwe\s+(?:would\s+like|need|require)\s+(?:to\s+receive\s+)?(?:a\s+)?(?:quotation|quote|price)\b/i, label: 'We need quotation' },
+      { pattern: /\bfor\s+the\s+(?:following\s+)?(?:items?|parts?|products?|materials?)\b/i, label: 'For the following items' },
+      { pattern: /\bbest\s+(?:price|offer|quotation)\s+(?:for|and)\s+(?:delivery|quality|lead\s*time)\b/i, label: 'Best price and delivery' },
+
+      // ─────────────────────────────────────────────────────────────────────
+      // PATTERNS AVEC NUMÉROS DE RÉFÉRENCE (PR, RFQ, etc.)
+      // ─────────────────────────────────────────────────────────────────────
+      { pattern: /\bpr\s*[-:#]?\s*\d{5,}/i, label: 'PR #xxxxx dans corps' },
+      { pattern: /\brfq\s*[-:#]?\s*[a-z0-9]{4,}/i, label: 'RFQ dans corps' },
+      { pattern: /\brequisition\s*[-:#]?\s*\d{4,}/i, label: 'Requisition #' },
     ];
 
     for (const { pattern, label } of bodyPatterns) {
       if (pattern.test(body)) {
-        return { isExplicitRfq: true, pattern: label };
+        return { isExplicitRfq: true, pattern: `[Corps] ${label}` };
       }
     }
 
