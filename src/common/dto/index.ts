@@ -72,4 +72,10 @@ export class EmailFilterDto {
 
   @IsOptional()
   unseen?: boolean;
+
+  @IsOptional()
+  since?: Date;
+
+  @IsOptional()
+  before?: Date;
 }

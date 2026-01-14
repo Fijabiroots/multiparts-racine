@@ -260,6 +260,24 @@ export interface ParseLog {
   // Performance
   processingTimeMs: number;
   extractionMethod: string;
+
+  // LLM Comparison (added after initial parsing)
+  llmComparison?: {
+    llmUsed: boolean;
+    llmItemCount: number;
+    regexItemCount: number;
+    llmWinner: boolean;              // True if LLM results were used
+    llmConfidence: number;
+    llmLanguage: 'fr' | 'en' | 'mixed';
+    llmDocType: string;
+    itemDifferences?: {
+      qtyDifferences: number;        // Items with different quantities
+      descDifferences: number;       // Items with different descriptions
+      brandDifferences: number;      // Items with different brands
+      partNumberDifferences: number; // Items with different part numbers
+    };
+    llmWarnings: string[];
+  };
 }
 
 // ============================================================================

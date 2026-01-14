@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Put, Body, Param, Query } from '@nestjs/common';
+import { Controller, Get, Post, Put, Delete, Body, Param, Query } from '@nestjs/common';
 import { DatabaseService } from './database.service';
 import { Client } from './entities';
 
@@ -175,6 +175,22 @@ export class DatabaseController {
       success: true,
       message: 'Données de traitement réinitialisées',
       deleted: counts,
+    };
+  }
+
+  /**
+   * Supprime un mapping RFQ spécifique pour permettre le retraitement
+   */
+  @Delete('rfq-mappings/:internalRfqNumber')
+  async deleteRfqMapping(@Param('internalRfqNumber') internalRfqNumber: string) {
+    const deleted = await this.databaseService.deleteRfqMapping(internalRfqNumber);
+    if (!deleted) {
+      return { error: 'Mapping non trouvé', internalRfqNumber };
+    }
+    return {
+      success: true,
+      message: `Mapping ${internalRfqNumber} supprimé, l'email sera retraité au prochain cycle`,
+      internalRfqNumber,
     };
   }
 }

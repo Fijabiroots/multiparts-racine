@@ -13,3 +13,4 @@ export * from './canonical-adapter.service';
 
 // Controller
 export * from './document-parser.controller';
+export * from './credit-monitor.service';

@@ -11,6 +11,7 @@ import { DraftModule } from '../draft/draft.module';
 import { MailModule } from '../mail/mail.module';
 import { TrackingModule } from '../tracking/tracking.module';
 import { IngestionModule } from '../ingestion/ingestion.module';
+import { LlmModule } from '../llm/llm.module';
 
 @Module({
   imports: [
@@ -23,6 +24,7 @@ import { IngestionModule } from '../ingestion/ingestion.module';
     MailModule,
     TrackingModule,
     IngestionModule,
+    LlmModule,
   ],
   providers: [SchedulerService, AutoProcessorService],
   controllers: [SchedulerController],

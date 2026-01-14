@@ -81,6 +81,12 @@ export class UnifiedIngestionService {
       this.logger.warn(`Failed to check brands reload: ${error.message}`);
     }
 
+    // Extraire la marque du sujet de l'email (ex: "TR: DEMANDE DE COTATION manitou Ton 234")
+    const subjectBrand = this.extractBrandFromSubject(email.subject);
+    if (subjectBrand) {
+      this.logger.debug(`Brand extracted from subject: ${subjectBrand}`);
+    }
+
     try {
       // 1. Process email body
       const bodyResult = await this.processEmailBody(email, logBuilder);
@@ -101,7 +107,17 @@ export class UnifiedIngestionService {
       if (attachmentResult.needsVerification) needsVerification = true;
       warnings.push(...attachmentResult.warnings);
 
-      // 3. Deduplicate items
+      // 3. Appliquer la marque du sujet aux items qui n'ont pas de marque valide
+      if (subjectBrand) {
+        for (const item of allItems) {
+          // Si l'item n'a pas de marque ou a une marque incorrecte (fuzzy match erroné)
+          if (!item.brand || this.isLikelyIncorrectBrand(item.brand, subjectBrand)) {
+            item.brand = subjectBrand;
+          }
+        }
+      }
+
+      // 4. Deduplicate items
       const deduplicatedItems = this.deduplicateItems(allItems);
       logBuilder.setLineCount(deduplicatedItems.length);
 
@@ -158,6 +174,18 @@ export class UnifiedIngestionService {
       mime: 'text/plain',
     });
 
+    // DEBUG: Log email body length and content
+    this.logger.debug(`[DEBUG] Email body length: ${email.body?.length || 0} chars`);
+    if (email.body && email.body.includes('Moteur')) {
+      this.logger.debug(`[DEBUG] Email body contains 'Moteur'`);
+    }
+    // Log lines with bullet items
+    const bulletLines = email.body?.split('\n').filter(l => l.includes('*') && l.includes('qty'));
+    this.logger.debug(`[DEBUG] Bullet lines with qty: ${bulletLines?.length || 0}`);
+    bulletLines?.forEach((line, idx) => {
+      this.logger.debug(`[DEBUG] Bullet ${idx + 1}: "${line.substring(0, 60)}..."`);
+    });
+
     // Extract content from email body
     const bodyParsed = await this.emailExtractor.parseEmailBody(
       email.body,
@@ -186,9 +214,12 @@ export class UnifiedIngestionService {
       rawText: bodyParsed.plainText,
     };
 
-    // Parse tables if found
-    if (bodyParsed.tables.length > 0) {
+    // Parse email body content (tables, bullet lists, structured text)
+    // Always parse if there's any content (rows or tables)
+    this.logger.debug(`[DEBUG] bodyParsed.rows: ${bodyParsed.rows.length}, bodyParsed.tables: ${bodyParsed.tables.length}`);
+    if (bodyParsed.rows.length > 0 || bodyParsed.tables.length > 0) {
       const tableResult = this.tableParser.parseDocument(normalizedDoc);
+      this.logger.debug(`[DEBUG] tableParser extracted ${tableResult.items.length} items`);
       items.push(...tableResult.items);
       logBuilder.applyExtractionResult(tableResult);
     }
@@ -721,5 +752,65 @@ export class UnifiedIngestionService {
     }
 
     return Array.from(seen.values());
+  }
+
+  /**
+   * Extraire la marque depuis le sujet de l'email
+   * Ex: "TR: DEMANDE DE COTATION manitou Ton 234" -> "MANITOU"
+   */
+  private extractBrandFromSubject(subject: string): string | undefined {
+    if (!subject) return undefined;
+
+    // Liste des marques connues à chercher dans le sujet
+    const knownBrands = [
+      'MANITOU', 'CATERPILLAR', 'CAT', 'KOMATSU', 'VOLVO', 'TEREX',
+      'JOHN DEERE', 'DEERE', 'JCB', 'LIEBHERR', 'CASE', 'NEW HOLLAND',
+      'HITACHI', 'KOBELCO', 'HYUNDAI', 'DOOSAN', 'DAEWOO', 'KUBOTA',
+      'BOBCAT', 'TAKEUCHI', 'YANMAR', 'SANDVIK', 'ATLAS COPCO',
+      'CUMMINS', 'PERKINS', 'DEUTZ', 'IVECO', 'SCANIA', 'MERCEDES',
+      'MAN', 'DAF', 'RENAULT', 'CLAAS', 'FENDT', 'MASSEY FERGUSON',
+      'SAME', 'LAMBORGHINI', 'DEUTZ-FAHR', 'VALTRA', 'FORD',
+      'BELL', 'GROVE', 'TADANO', 'DEMAG', 'POTAIN', 'ZOOMLION',
+      'SANY', 'XCMG', 'SDLG', 'LIUGONG', 'SHANTUI', 'LONKING',
+      'DANA', 'SPICER', 'PARKER', 'REXROTH', 'BOSCH', 'SKF', 'TIMKEN',
+      'FIRETROL', 'GRUNDFOS', 'PENTAIR', 'CONTRINEX', 'SIEMENS', 'ABB',
+    ];
+
+    const subjectUpper = subject.toUpperCase();
+
+    // Chercher une marque connue dans le sujet
+    for (const brand of knownBrands) {
+      // Vérifier que c'est un mot complet (pas partie d'un autre mot)
+      const regex = new RegExp(`\\b${brand.replace(/\s+/g, '\\s+')}\\b`, 'i');
+      if (regex.test(subjectUpper)) {
+        return brand;
+      }
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Vérifie si une marque détectée est probablement incorrecte
+   * (fuzzy match erroné vs marque du sujet)
+   */
+  private isLikelyIncorrectBrand(detectedBrand: string, subjectBrand: string): boolean {
+    if (!detectedBrand || !subjectBrand) return false;
+
+    const detected = detectedBrand.toUpperCase();
+    const subject = subjectBrand.toUpperCase();
+
+    // Si c'est la même marque, pas d'erreur
+    if (detected === subject) return false;
+
+    // Marques qui sont souvent des faux positifs par fuzzy matching
+    // quand la vraie marque est différente
+    const likelyFalsePositives = [
+      'FIRETROL',   // Match faux pour "FILTRE"
+      'CONTRINEX', // Match faux pour codes numériques
+      'PENTAIR',    // Match faux pour "PREFILTRE"
+    ];
+
+    return likelyFalsePositives.includes(detected);
   }
 }

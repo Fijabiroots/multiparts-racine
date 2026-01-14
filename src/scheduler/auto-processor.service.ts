@@ -1,5 +1,7 @@
 import { Injectable, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import * as fs from 'fs';
+import * as path from 'path';
 import { DatabaseService } from '../database/database.service';
 import { EmailService } from '../email/email.service';
 import { DetectorService } from '../detector/detector.service';
@@ -20,6 +22,7 @@ import {
 } from '../common/client-requirements';
 
 interface ProcessOptions {
+  startDate?: Date;
   endDate?: Date;
   folders: string[];
   autoSendDraft: boolean;
@@ -115,10 +118,24 @@ export class AutoProcessorService {
           limit: 500, // Augmenté pour traiter tous les emails en attente
         });
 
-        this.logger.log(`${emails.length} emails non lus trouvés dans ${folder}`);
+        // IMPORTANT: Trier par date croissante (les plus anciens d'abord)
+        // Cela garantit que les relances sont détectées correctement
+        emails.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+
+        this.logger.log(`${emails.length} emails non lus trouvés dans ${folder} (triés par date)`);
 
         for (const email of emails) {
-          // Vérifier la date limite
+          // Vérifier les limites de date
+          if (options.startDate && email.date < options.startDate) {
+            result.skipped++;
+            result.details.push({
+              emailId: email.id,
+              subject: email.subject,
+              status: 'skipped',
+              error: 'Email avant la date de début',
+            });
+            continue;
+          }
           if (options.endDate && email.date > options.endDate) {
             result.skipped++;
             result.details.push({
@@ -159,13 +176,36 @@ export class AutoProcessorService {
               status: 'skipped',
               error: `Offre fournisseur détectée: ${supplierCheck.reason}`,
             });
-            
+
             await this.databaseService.addProcessingLog({
               emailId: email.id,
               action: 'filter',
               status: 'skipped',
               message: `Offre fournisseur: ${supplierCheck.reason}`,
             });
+            continue;
+          }
+
+          // NOUVEAU: Vérifier si c'est une relance d'une demande existante
+          const relanceCheck = await this.detectRelance(email);
+          if (relanceCheck.isRelance) {
+            result.skipped++;
+            result.details.push({
+              emailId: email.id,
+              subject: email.subject,
+              status: 'skipped',
+              internalRfqNumber: relanceCheck.existingRfqNumber,
+              error: relanceCheck.reason,
+            });
+
+            await this.databaseService.addProcessingLog({
+              emailId: email.id,
+              action: 'filter',
+              status: 'skipped',
+              message: relanceCheck.reason || 'Relance détectée',
+            });
+
+            this.logger.log(`Relance ignorée: ${email.subject} -> ${relanceCheck.existingRfqNumber}`);
             continue;
           }
 
@@ -411,7 +451,10 @@ export class AutoProcessorService {
     }
 
     // 3.5 LLM Fallback: Si peu d'items extraits, quantités suspectes, ou LLM_MODE=always
+    const regexItemCount = allItems.length;
+    const regexItems = [...allItems]; // Save copy for comparison
     const shouldUseLlm = this.shouldTriggerLlmFallback(allItems.length, needsManualReview, allItems);
+
     if (shouldUseLlm && this.llmExtraction && this.canonicalAdapter) {
       this.logger.log(`LLM Fallback triggered: ${allItems.length} items extracted, mode=${this.llmMode}`);
 
@@ -431,6 +474,22 @@ export class AutoProcessorService {
           this.llmMode === 'always'
             ? llmItems.length > 0
             : llmItems.length > allItems.length;
+
+        // Save LLM comparison data to parse log
+        if (this.parseLogService) {
+          const itemDifferences = this.computeItemDifferences(regexItems, llmItems);
+          await this.parseLogService.updateLlmComparison(internalRfqNumber, {
+            llmUsed: true,
+            llmItemCount: llmItems.length,
+            regexItemCount: regexItemCount,
+            llmWinner: shouldUseLlmResults,
+            llmConfidence: llmResult._meta.confidence_score,
+            llmLanguage: llmResult._meta.detected_language,
+            llmDocType: llmResult._meta.detected_type,
+            itemDifferences,
+            llmWarnings: llmResult._meta.warnings || [],
+          });
+        }
 
         if (shouldUseLlmResults) {
           this.logger.log(`LLM extracted ${llmItems.length} items (vs ${allItems.length} from regex), mode=${this.llmMode}`);
@@ -453,6 +512,18 @@ export class AutoProcessorService {
         this.logger.error(`LLM extraction failed: ${llmError}`);
         // Continue with regex results
       }
+    } else if (this.parseLogService && this.llmMode !== 'off') {
+      // Log that LLM was not triggered
+      await this.parseLogService.updateLlmComparison(internalRfqNumber, {
+        llmUsed: false,
+        llmItemCount: 0,
+        regexItemCount: regexItemCount,
+        llmWinner: false,
+        llmConfidence: 0,
+        llmLanguage: 'mixed',
+        llmDocType: 'UNKNOWN',
+        llmWarnings: ['LLM not triggered'],
+      });
     }
 
     // 4. Si aucun item, créer un item générique
@@ -524,11 +595,13 @@ export class AutoProcessorService {
       const senderName = this.extractName(email.from);
       const clientName = client?.name || senderName || this.extractCompanyFromEmail(senderEmail);
 
-      // Collecter toutes les pièces jointes supplémentaires
-      const attachmentPaths = [
-        ...group.technicalSheets.map(ts => ts.attachment.filename),
-        ...images.map(img => img.attachment.filename),
+      // Sauvegarder les pièces jointes originales sur disque
+      const allOriginalAttachments = [
+        ...group.rfqAttachments.map(rfq => rfq.attachment),
+        ...group.technicalSheets.map(ts => ts.attachment),
+        ...images.map(img => img.attachment),
       ];
+      const savedAttachmentPaths = this.saveAttachmentsToDisk(allOriginalAttachments, internalRfqNumber);
 
       const draftId = await this.databaseService.createPendingDraft({
         rfqMappingId: mapping?.id,
@@ -539,7 +612,7 @@ export class AutoProcessorService {
         recipient: 'procurement@multipartsci.com',
         subject: `Demande de Prix N° ${internalRfqNumber}${group.brand ? ` - ${group.brand}` : ''}${clientRfqNumber ? ` - Réf. Client: ${clientRfqNumber}` : ''}`,
         excelPath: generated.excelPath,
-        attachmentPaths,
+        attachmentPaths: savedAttachmentPaths,
       });
 
       await this.databaseService.addOutputLog({
@@ -566,6 +639,12 @@ export class AutoProcessorService {
             content: generated.excelBuffer,
             contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
           },
+          // Ajouter les pièces jointes RFQ originales (PDF/Excel sources)
+          ...group.rfqAttachments.map(rfq => ({
+            filename: rfq.attachment.filename,
+            content: rfq.attachment.content,
+            contentType: rfq.attachment.contentType,
+          })),
           // Ajouter les fiches techniques
           ...group.technicalSheets.map(ts => ({
             filename: ts.attachment.filename,
@@ -716,6 +795,75 @@ export class AutoProcessorService {
       }
     }
 
+    // LLM Fallback: Si peu d'items extraits, quantités suspectes, ou LLM_MODE=always
+    const regexItemCount = allItems.length;
+    const regexItems = [...allItems];
+    const shouldUseLlm = this.shouldTriggerLlmFallback(allItems.length, needsManualReview, allItems);
+
+    if (shouldUseLlm && this.llmExtraction && this.canonicalAdapter) {
+      this.logger.log(`[Classic] LLM Fallback triggered: ${allItems.length} items extracted, mode=${this.llmMode}`);
+
+      try {
+        const llmInputs = email.attachments.map(att => ({
+          content: att.content,
+          filename: att.filename,
+          mimeType: att.contentType,
+        }));
+
+        const llmResult = await this.llmExtraction.extractAndMerge(llmInputs);
+        const llmItems = this.canonicalAdapter.toPriceRequestItems(llmResult);
+
+        const shouldUseLlmResults =
+          this.llmMode === 'always'
+            ? llmItems.length > 0
+            : llmItems.length > allItems.length;
+
+        // Save LLM comparison data to parse log
+        if (this.parseLogService) {
+          const itemDifferences = this.computeItemDifferences(regexItems, llmItems);
+          await this.parseLogService.updateLlmComparison(internalRfqNumber, {
+            llmUsed: true,
+            llmItemCount: llmItems.length,
+            regexItemCount: regexItemCount,
+            llmWinner: shouldUseLlmResults,
+            llmConfidence: llmResult._meta.confidence_score,
+            llmLanguage: llmResult._meta.detected_language,
+            llmDocType: llmResult._meta.detected_type,
+            itemDifferences,
+            llmWarnings: llmResult._meta.warnings || [],
+          });
+        }
+
+        if (shouldUseLlmResults) {
+          this.logger.log(`[Classic] LLM extracted ${llmItems.length} items (vs ${allItems.length} from regex), mode=${this.llmMode}`);
+          allItems = llmItems;
+
+          if (!clientRfqNumber && llmResult.document_number !== 'UNKNOWN') {
+            clientRfqNumber = llmResult.document_number;
+          }
+
+          if (llmResult._meta.confidence_score < this.llmMinConfidenceThreshold) {
+            needsManualReview = true;
+          }
+        } else {
+          this.logger.debug(`[Classic] LLM results not used: ${llmItems.length} LLM items vs ${allItems.length} regex items`);
+        }
+      } catch (llmError) {
+        this.logger.error(`[Classic] LLM extraction failed: ${llmError}`);
+      }
+    } else if (this.parseLogService && this.llmMode !== 'off') {
+      await this.parseLogService.updateLlmComparison(internalRfqNumber, {
+        llmUsed: false,
+        llmItemCount: 0,
+        regexItemCount: regexItemCount,
+        llmWinner: false,
+        llmConfidence: 0,
+        llmLanguage: 'mixed',
+        llmDocType: 'UNKNOWN',
+        llmWarnings: ['LLM not triggered (classic path)'],
+      });
+    }
+
     // Si aucun item, en créer un générique
     if (allItems.length === 0) {
       allItems.push({
@@ -782,7 +930,13 @@ export class AutoProcessorService {
       const senderEmail = this.extractEmail(email.from);
       const senderName = this.extractName(email.from);
       const clientName = client?.name || senderName || this.extractCompanyFromEmail(senderEmail);
-      
+
+      // Filtrer les images de signature/logo avant de sauvegarder
+      const filteredAttachments = email.attachments.filter(
+        att => !this.attachmentClassifier.isSignatureImage(att.filename, att.size)
+      );
+      const savedAttachmentPaths = this.saveAttachmentsToDisk(filteredAttachments, internalRfqNumber);
+
       // Créer le brouillon en attente dans la base de données
       // Il sera envoyé automatiquement au prochain cycle du scheduler (5 min)
       const draftId = await this.databaseService.createPendingDraft({
@@ -794,10 +948,7 @@ export class AutoProcessorService {
         recipient: 'procurement@multipartsci.com', // Toujours vers procurement
         subject: `Demande de Prix N° ${internalRfqNumber}${clientRfqNumber ? ` - Réf. Client: ${clientRfqNumber}` : ''}`,
         excelPath: generated.excelPath,
-        // Ajouter les pièces jointes images si présentes
-        attachmentPaths: email.attachments
-          .filter(att => att.contentType?.startsWith('image/'))
-          .map(att => att.filename),
+        attachmentPaths: savedAttachmentPaths,
       });
 
       // Logger la création du brouillon
@@ -818,15 +969,26 @@ export class AutoProcessorService {
 
       // AUSSI sauvegarder dans IMAP (Brouillons Thunderbird) pour visualisation
       try {
+        // Préparer les pièces jointes: Excel généré + originales
+        const draftAttachments = [
+          {
+            filename: `${internalRfqNumber}.xlsx`,
+            content: generated.excelBuffer,
+            contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          },
+          // Ajouter les pièces jointes originales (sans les signatures/logos)
+          ...filteredAttachments.map(att => ({
+            filename: att.filename,
+            content: att.content,
+            contentType: att.contentType,
+          })),
+        ];
+
         await this.draftService.saveToDrafts({
           to: 'procurement@multipartsci.com',
           subject: `Demande de Prix N° ${internalRfqNumber}${clientRfqNumber ? ` - Réf. Client: ${clientRfqNumber}` : ''}`,
           body: this.generateEmailBodyForProcurement(internalRfqNumber, clientRfqNumber, clientName, senderEmail, allItems.length),
-          attachments: [{
-            filename: `${internalRfqNumber}.xlsx`,
-            content: generated.excelBuffer,
-            contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-          }],
+          attachments: draftAttachments,
         });
       } catch (error) {
         this.logger.warn(`Impossible de sauvegarder dans IMAP Drafts: ${error.message}`);
@@ -1215,6 +1377,102 @@ Pour toute correspondance, veuillez utiliser la référence : ${rfqNumber}`;
   }
 
   /**
+   * Détecte si l'email est une relance d'une demande existante
+   * Retourne le RFQ interne existant si c'est une relance
+   */
+  private async detectRelance(
+    email: ParsedEmail,
+  ): Promise<{ isRelance: boolean; existingRfqNumber?: string; reason?: string }> {
+    const subject = (email.subject || '').toLowerCase();
+    const senderEmail = this.extractEmail(email.from);
+
+    // 1) Patterns de relance dans le sujet
+    const relancePatterns = [
+      /^re\s*:/i,
+      /^tr\s*:/i,
+      /^fw[d]?\s*:/i,
+      /relance/i,
+      /rappel/i,
+      /reminder/i,
+      /follow[\s-]?up/i,
+      /urgent.*relance/i,
+      /2[eè]me?\s*(demande|envoi)/i,
+      /second\s*(request|reminder)/i,
+    ];
+
+    const isRelanceSubject = relancePatterns.some(p => p.test(email.subject || ''));
+
+    // 2) Extraire le sujet "nettoyé" (sans Re:, Fwd:, etc.)
+    let cleanSubject = (email.subject || '')
+      .replace(/^(re|tr|fwd?|fw)\s*:\s*/gi, '')
+      .replace(/^\[.*?\]\s*/g, '')
+      .replace(/\*+spam\*+\s*/gi, '')
+      .trim()
+      .toLowerCase();
+
+    // 3) Chercher un RFQ client dans le sujet
+    const clientRfqPatterns = [
+      /pr[\s_-]?(\d{6,})/i,                    // PR 11129020
+      /rfq[\s_-]?([a-z0-9\-_]+)/i,             // RFQ-xxx
+      /da[\s_-]?(\d{4}[\/-]\d+)/i,             // DA2025-175
+      /bi[\s_-]?(\d+)/i,                       // BI 740
+      /pr[\s_-]?(\d+[\/-]\d+)/i,               // PR-687 or PR_2619
+    ];
+
+    let extractedClientRfq: string | undefined;
+    for (const pattern of clientRfqPatterns) {
+      const match = (email.subject || '').match(pattern);
+      if (match) {
+        extractedClientRfq = match[0].toUpperCase().replace(/[\s_]/g, '-');
+        break;
+      }
+    }
+
+    // 4) Si on a un RFQ client, vérifier s'il existe déjà en BDD
+    if (extractedClientRfq) {
+      const existingMapping = await this.databaseService.getRfqMappingByClientRfq(extractedClientRfq);
+      if (existingMapping) {
+        return {
+          isRelance: true,
+          existingRfqNumber: existingMapping.internalRfqNumber,
+          reason: `Relance détectée: RFQ client ${extractedClientRfq} déjà traité comme ${existingMapping.internalRfqNumber}`,
+        };
+      }
+    }
+
+    // 5) Chercher par sujet similaire du même expéditeur
+    if (isRelanceSubject && cleanSubject.length > 10) {
+      const existingBySubject = await this.databaseService.findRfqBySubjectAndSender(
+        cleanSubject,
+        senderEmail,
+      );
+      if (existingBySubject) {
+        return {
+          isRelance: true,
+          existingRfqNumber: existingBySubject.internalRfqNumber,
+          reason: `Relance détectée: sujet similaire déjà traité comme ${existingBySubject.internalRfqNumber}`,
+        };
+      }
+    }
+
+    // 6) Vérifier les headers de thread (References, In-Reply-To)
+    if (email.references && email.references.length > 0) {
+      for (const refMessageId of email.references) {
+        const existingByRef = await this.databaseService.getRfqMappingByMessageId(refMessageId);
+        if (existingByRef) {
+          return {
+            isRelance: true,
+            existingRfqNumber: existingByRef.internalRfqNumber,
+            reason: `Relance détectée: réponse à un thread existant (${existingByRef.internalRfqNumber})`,
+          };
+        }
+      }
+    }
+
+    return { isRelance: false };
+  }
+
+  /**
    * Détermine si le fallback LLM doit être activé
    * @param itemCount Nombre d'items extraits par regex
    * @param needsManualReview Flag de révision manuelle
@@ -1266,5 +1524,94 @@ Pour toute correspondance, veuillez utiliser la référence : ${rfqNumber}`;
       default:
         return false;
     }
+  }
+
+  /**
+   * Compare regex and LLM items to identify differences
+   */
+  private computeItemDifferences(
+    regexItems: PriceRequestItem[],
+    llmItems: PriceRequestItem[],
+  ): { qtyDifferences: number; descDifferences: number; brandDifferences: number; partNumberDifferences: number } {
+    const result = {
+      qtyDifferences: 0,
+      descDifferences: 0,
+      brandDifferences: 0,
+      partNumberDifferences: 0,
+    };
+
+    const minLength = Math.min(regexItems.length, llmItems.length);
+
+    for (let i = 0; i < minLength; i++) {
+      const regex = regexItems[i];
+      const llm = llmItems[i];
+
+      // Compare quantities
+      if ((regex.quantity || 0) !== (llm.quantity || 0)) {
+        result.qtyDifferences++;
+      }
+
+      // Compare descriptions (using normalized comparison)
+      const regexDesc = (regex.description || '').toLowerCase().trim().substring(0, 50);
+      const llmDesc = (llm.description || '').toLowerCase().trim().substring(0, 50);
+      if (regexDesc !== llmDesc && !regexDesc.includes(llmDesc) && !llmDesc.includes(regexDesc)) {
+        result.descDifferences++;
+      }
+
+      // Compare brands
+      const regexBrand = (regex.brand || '').toUpperCase().trim();
+      const llmBrand = (llm.brand || '').toUpperCase().trim();
+      if (regexBrand !== llmBrand) {
+        result.brandDifferences++;
+      }
+
+      // Compare part numbers (supplierCode in PriceRequestItem)
+      const regexPartNo = (regex.supplierCode || '').trim();
+      const llmPartNo = (llm.supplierCode || '').trim();
+      if (regexPartNo !== llmPartNo) {
+        result.partNumberDifferences++;
+      }
+    }
+
+    // If counts differ, add the difference
+    if (regexItems.length !== llmItems.length) {
+      const diff = Math.abs(regexItems.length - llmItems.length);
+      result.qtyDifferences += diff;
+      result.descDifferences += diff;
+    }
+
+    return result;
+  }
+
+  /**
+   * Sauvegarder les pièces jointes sur disque dans le dossier output
+   * Retourne les chemins complets des fichiers sauvegardés
+   */
+  private saveAttachmentsToDisk(
+    attachments: EmailAttachment[],
+    internalRfqNumber: string,
+  ): string[] {
+    const outputDir = this.configService.get<string>('OUTPUT_DIR', './output');
+    const savedPaths: string[] = [];
+
+    for (const att of attachments) {
+      if (!att.content || !att.filename) continue;
+
+      // Créer un nom de fichier unique avec le numéro RFQ
+      const ext = path.extname(att.filename);
+      const baseName = path.basename(att.filename, ext);
+      const safeFilename = `${internalRfqNumber}_${baseName}${ext}`.replace(/[^a-zA-Z0-9._-]/g, '_');
+      const filePath = path.join(outputDir, safeFilename);
+
+      try {
+        fs.writeFileSync(filePath, att.content);
+        savedPaths.push(filePath);
+        this.logger.debug(`Pièce jointe sauvegardée: ${filePath}`);
+      } catch (error) {
+        this.logger.warn(`Erreur sauvegarde ${att.filename}: ${error.message}`);
+      }
+    }
+
+    return savedPaths;
   }
 }

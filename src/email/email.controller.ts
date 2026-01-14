@@ -1,4 +1,4 @@
-import { Controller, Get, Query, Param } from '@nestjs/common';
+import { Controller, Get, Post, Query, Param } from '@nestjs/common';
 import { EmailService } from './email.service';
 import { EmailFilterDto } from '../common/dto';
 
@@ -68,5 +68,11 @@ export class EmailController {
         size: a.size,
       })),
     };
+  }
+
+  @Post('mark-unread/:id')
+  async markAsUnread(@Param('id') id: string, @Query('folder') folder?: string) {
+    const success = await this.emailService.markAsUnread(id, folder);
+    return { success, message: success ? 'Email marqué comme non lu' : 'Erreur' };
   }
 }

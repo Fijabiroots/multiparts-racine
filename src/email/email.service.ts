@@ -77,6 +77,13 @@ export class EmailService {
       if (filter.subject) {
         searchCriteria.push(['SUBJECT', filter.subject]);
       }
+      // Filtres de date IMAP (SINCE = à partir de, BEFORE = avant)
+      if (filter.since) {
+        searchCriteria.push(['SINCE', filter.since]);
+      }
+      if (filter.before) {
+        searchCriteria.push(['BEFORE', filter.before]);
+      }
 
       const fetchOptions = {
         bodies: ['HEADER', 'TEXT', ''],
@@ -195,5 +202,24 @@ export class EmailService {
     return emails.filter((email) =>
       email.attachments.some((att) => att.contentType === 'application/pdf'),
     );
+  }
+
+  /**
+   * Marquer un email comme non lu (retirer le flag SEEN)
+   */
+  async markAsUnread(emailId: string, folder = 'INBOX'): Promise<boolean> {
+    const connection = await this.connect();
+
+    try {
+      await connection.openBox(folder);
+      await connection.delFlags(emailId, ['\\Seen']);
+      this.logger.log(`Email ${emailId} marqué comme non lu`);
+      return true;
+    } catch (error) {
+      this.logger.error(`Erreur markAsUnread: ${error.message}`);
+      return false;
+    } finally {
+      connection.end();
+    }
   }
 }

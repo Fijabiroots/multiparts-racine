@@ -146,8 +146,50 @@ export class DocumentParserService {
   private extractItemsFromEmailBody(body: string): PriceRequestItem[] {
     const items: PriceRequestItem[] = [];
     const text = body.toLowerCase();
-    
-    // Pattern 1: "cotation de X unités de ce matériel"
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Pattern 0: Listes à puces avec format (qty N) ou (qty: N)
+    // Exemple: "  *   Filtre a huile 943343 (qty 3)"
+    // ═══════════════════════════════════════════════════════════════════════
+    const bulletListPattern = /^[\s]*[\*\-•·]\s*(.+?)\s*\(qty[:\s]*(\d+)\)\s*$/gmi;
+    let bulletMatch;
+    const bulletItems: PriceRequestItem[] = [];
+
+    while ((bulletMatch = bulletListPattern.exec(body)) !== null) {
+      const description = bulletMatch[1].trim();
+      const qty = parseInt(bulletMatch[2], 10);
+
+      if (description && qty > 0) {
+        // Extraire le numéro de pièce si présent (ex: "Filtre a huile 943343")
+        const partNoMatch = description.match(/^(.+?)\s+(\d{5,})\s*$/);
+        let finalDescription = description;
+        let supplierCode: string | undefined;
+
+        if (partNoMatch) {
+          finalDescription = partNoMatch[1].trim();
+          supplierCode = partNoMatch[2];
+        }
+
+        bulletItems.push({
+          description: finalDescription.toUpperCase(),
+          quantity: qty,
+          unit: 'pcs',
+          supplierCode,
+          needsManualReview: false,
+          isEstimated: false,
+        });
+      }
+    }
+
+    // Si on a trouvé des items en liste à puces, les retourner directement
+    if (bulletItems.length > 0) {
+      this.logger.debug(`Extracted ${bulletItems.length} items from bullet list with (qty N) format`);
+      return bulletItems;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Pattern 1: "cotation de X unités de ce matériel" (format classique)
+    // ═══════════════════════════════════════════════════════════════════════
     let quantity = 1;
     const qtyPatterns = [
       /cotation\s+de\s+(\d+)\s+unit[ée]s?/i,

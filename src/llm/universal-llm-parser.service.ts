@@ -1,6 +1,7 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit, Inject, forwardRef } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import Anthropic from '@anthropic-ai/sdk';
+import { CreditMonitorService } from './credit-monitor.service';
 
 // ============================================================
 // SCHÉMA CANONIQUE UNIVERSEL
@@ -93,7 +94,11 @@ export class UniversalLlmParserService implements OnModuleInit {
   private isConfigured = false;
   private readonly model = 'claude-sonnet-4-20250514';
 
-  constructor(private configService: ConfigService) {}
+  constructor(
+    private configService: ConfigService,
+    @Inject(forwardRef(() => CreditMonitorService))
+    private creditMonitor: CreditMonitorService,
+  ) {}
 
   async onModuleInit() {
     const apiKey = this.configService.get<string>('ANTHROPIC_API_KEY');
@@ -150,6 +155,8 @@ export class UniversalLlmParserService implements OnModuleInit {
           messages: [{ role: 'user', content: userPrompt }],
         });
 
+        this.creditMonitor.resetStatus();
+
         const content = response.content[0];
         if (content.type !== 'text') {
           throw new Error('Réponse inattendue');
@@ -169,7 +176,10 @@ export class UniversalLlmParserService implements OnModuleInit {
       } catch (error) {
         lastError = error as Error;
         this.logger.warn(`Tentative ${attempt} échouée: ${lastError.message}`);
-        
+
+        // Vérifier erreur de crédit et notifier
+        await this.creditMonitor.checkApiError(error);
+
         if (attempt < maxRetries) {
           await this.sleep(1000 * attempt);
         }

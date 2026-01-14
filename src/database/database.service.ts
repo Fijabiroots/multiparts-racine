@@ -625,6 +625,27 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     return this.mapRowToRfqMapping(result[0].columns, result[0].values[0]);
   }
 
+  // Chercher un RFQ existant par sujet similaire et même expéditeur (pour détecter les relances)
+  async findRfqBySubjectAndSender(cleanSubject: string, senderEmail: string): Promise<RfqMapping | null> {
+    if (!cleanSubject || !senderEmail) return null;
+
+    // Chercher avec LIKE pour les sujets similaires (au moins 70% de correspondance)
+    // On utilise le sujet nettoyé (sans Re:, Fwd:, etc.)
+    const searchPattern = `%${cleanSubject.substring(0, Math.min(50, cleanSubject.length))}%`;
+
+    const result = this.db.exec(`
+      SELECT rm.* FROM rfq_mappings rm
+      JOIN clients c ON rm.client_id = c.id
+      WHERE c.email = ?
+      AND LOWER(rm.email_subject) LIKE ?
+      ORDER BY rm.received_at DESC
+      LIMIT 1
+    `, [senderEmail.toLowerCase(), searchPattern]);
+
+    if (result.length === 0 || result[0].values.length === 0) return null;
+    return this.mapRowToRfqMapping(result[0].columns, result[0].values[0]);
+  }
+
   // ============ PENDING DRAFTS (Brouillons en attente) ============
 
   async createPendingDraft(draft: {
@@ -1048,5 +1069,38 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     this.logger.warn(`🔄 RESET: Données de traitement réinitialisées - RFQ: ${counts.rfqMappings}, Logs: ${counts.processingLogs}, Drafts: ${counts.pendingDrafts}, Output: ${counts.outputLogs}`);
 
     return counts;
+  }
+
+  /**
+   * Supprime un mapping RFQ spécifique par son numéro interne
+   * Permet de retraiter un email spécifique
+   */
+  async deleteRfqMapping(internalRfqNumber: string): Promise<boolean> {
+    try {
+      // Récupérer le mapping avant suppression
+      const mapping = this.db.exec(`SELECT id, email_id FROM rfq_mappings WHERE internal_rfq_number = ?`, [internalRfqNumber]);
+      if (mapping.length === 0 || !mapping[0].values.length) {
+        return false;
+      }
+
+      const mappingId = mapping[0].values[0][0];
+      const emailId = mapping[0].values[0][1];
+
+      // Supprimer les logs associés
+      this.db.run(`DELETE FROM processing_logs WHERE rfq_mapping_id = ?`, [mappingId]);
+      this.db.run(`DELETE FROM output_logs WHERE rfq_mapping_id = ?`, [mappingId]);
+      this.db.run(`DELETE FROM pending_drafts WHERE rfq_mapping_id = ?`, [mappingId]);
+
+      // Supprimer le mapping
+      this.db.run(`DELETE FROM rfq_mappings WHERE internal_rfq_number = ?`, [internalRfqNumber]);
+
+      this.saveToFile();
+      this.logger.log(`🗑️ Mapping supprimé: ${internalRfqNumber} (email_id: ${emailId})`);
+
+      return true;
+    } catch (error) {
+      this.logger.error(`Erreur suppression mapping ${internalRfqNumber}: ${error.message}`);
+      return false;
+    }
   }
 }

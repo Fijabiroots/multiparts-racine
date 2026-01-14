@@ -824,11 +824,167 @@ export class TableParserService implements OnModuleInit {
 
     this.logger.debug(`Extracting from rows starting at ${startRow}, total rows: ${rows.length}`);
 
+    // Debug: log all bullet-like lines to trace extraction
+    for (const row of rows) {
+      if (row.raw.includes('*') || row.raw.includes('qty') || row.raw.toLowerCase().includes('moteur')) {
+        this.logger.debug(`[DEBUG ROW] Line ${row.lineNumber}: "${row.raw.substring(0, 80)}..."`);
+      }
+    }
+
     for (let i = startRow; i < rows.length; i++) {
       const row = rows[i];
       if (!row.raw.trim()) continue;
 
       if (this.isNoiseLine(row.raw)) continue;
+
+      // Caractères de puce supportés: *, -, •, ·, –, —, ►, ▪, ○, ●, ◆, ▸, ➤, ➢, ✓, ✔, >, », ⁃
+      const BULLET_CHARS = '[\\*\\-•·–—►▪○●◆▸➤➢✓✔>»⁃]';
+
+      // *** Pattern pour listes à puces avec format (qty N) ***
+      // Ex: "* Filtre a huile 943343 (qty 3)" ou "  -   Prefiltre 706497 (qty 3)" ou "► Pompe (qty 2)"
+      const bulletQtyMatch = row.raw.match(new RegExp(`^[\\s]*${BULLET_CHARS}\\s*(.+?)\\s*\\(qty[:\\s]*(\\d+)\\)\\s*$`, 'i'));
+      if (bulletQtyMatch) {
+        const desc = bulletQtyMatch[1].trim();
+        const qty = parseInt(bulletQtyMatch[2], 10);
+
+        // Extraire le code fournisseur du texte (nombre à 5+ chiffres à la fin)
+        const supplierCodeMatch = desc.match(/\s+(\d{5,})\s*$/);
+        let finalDesc = desc;
+        let supplierCode: string | undefined;
+
+        if (supplierCodeMatch) {
+          supplierCode = supplierCodeMatch[1];
+          finalDesc = desc.substring(0, desc.lastIndexOf(supplierCode)).trim();
+        }
+
+        // Extraire la marque si présente
+        const brand = this.extractBrand(finalDesc);
+
+        const bulletItem: PriceRequestItem = {
+          description: finalDesc.toUpperCase(),
+          quantity: qty,
+          unit: 'pcs',
+          supplierCode,
+          brand,
+          needsManualReview: false,
+          isEstimated: false,
+          isBulletListItem: true,
+          originalLine: i,
+        };
+
+        this.logger.debug(`[DEBUG bullet] Extracted: "${finalDesc}" qty=${qty} code=${supplierCode || 'NONE'}`);
+        items.push(bulletItem);
+        lastItem = bulletItem;
+        continuationsPerItem.set(bulletItem, 0);
+        continue;
+      }
+
+      // *** Pattern pour listes à puces SANS format (qty N) - quantité par défaut = 1 ***
+      // Ex: "* Moteur complet" ou "  -   Filtre a huile boite 745878" ou "► Pompe hydraulique"
+      const bulletNoQtyMatch = row.raw.match(new RegExp(`^[\\s]*${BULLET_CHARS}\\s+(.+)$`));
+      if (bulletNoQtyMatch && !row.raw.toLowerCase().includes('(qty')) {
+        const desc = bulletNoQtyMatch[1].trim();
+
+        // Ignorer les lignes qui ressemblent à des séparateurs ou des titres courts
+        if (desc.length >= 5 && !desc.match(/^[-=_*►▪○●◆▸➤➢✓✔>»⁃]+$/)) {
+          // Extraire le code fournisseur du texte (nombre à 5+ chiffres à la fin)
+          const supplierCodeMatch = desc.match(/\s+(\d{5,})\s*$/);
+          let finalDesc = desc;
+          let supplierCode: string | undefined;
+
+          if (supplierCodeMatch) {
+            supplierCode = supplierCodeMatch[1];
+            finalDesc = desc.substring(0, desc.lastIndexOf(supplierCode)).trim();
+          }
+
+          // Extraire la marque si présente
+          const brand = this.extractBrand(finalDesc);
+
+          const bulletItem: PriceRequestItem = {
+            description: finalDesc.toUpperCase(),
+            quantity: 1, // Quantité par défaut
+            unit: 'pcs',
+            supplierCode,
+            brand,
+            needsManualReview: true, // Flag car quantité estimée
+            isEstimated: true,
+            isBulletListItem: true,
+            originalLine: i,
+          };
+
+          items.push(bulletItem);
+          lastItem = bulletItem;
+          continuationsPerItem.set(bulletItem, 0);
+          this.logger.debug(`Bullet item without qty at line ${i}: "${finalDesc}" (default qty=1)`);
+          continue;
+        }
+      }
+
+      // *** Pattern pour lignes de tableau email: "| Description | Qty | Unit |" ***
+      // Supporte les formats: "| col1 | col2 |" ou "col1 | col2 | col3"
+      const tableCellMatch = row.raw.match(/^[\s]*\|?\s*([^|]+)\s*\|\s*(\d+)\s*\|\s*(pcs|ea|lot|set|kg|m|l|unit[es]?)?[\s|]*$/i);
+      if (tableCellMatch) {
+        const desc = tableCellMatch[1].trim();
+        const qty = parseInt(tableCellMatch[2], 10);
+        const unit = tableCellMatch[3]?.toLowerCase() || 'pcs';
+
+        if (desc.length >= 3 && qty > 0 && qty <= 10000 && !this.isNoiseLine(desc)) {
+          const supplierCodeMatch = desc.match(/\s+(\d{5,})\s*$/);
+          let finalDesc = desc;
+          let supplierCode: string | undefined;
+
+          if (supplierCodeMatch) {
+            supplierCode = supplierCodeMatch[1];
+            finalDesc = desc.substring(0, desc.lastIndexOf(supplierCode)).trim();
+          }
+
+          const brand = this.extractBrand(finalDesc);
+
+          const tableItem: PriceRequestItem = {
+            description: finalDesc.toUpperCase(),
+            quantity: qty,
+            unit: unit === 'ea' ? 'pcs' : unit,
+            supplierCode,
+            brand,
+            isEmailTableItem: true,
+            originalLine: i,
+          };
+
+          items.push(tableItem);
+          lastItem = tableItem;
+          continuationsPerItem.set(tableItem, 0);
+          this.logger.debug(`Email table item at line ${i}: "${finalDesc}" qty=${qty}`);
+          continue;
+        }
+      }
+
+      // *** Pattern alternatif tableau: "Description    Qty    Unit" (séparé par espaces/tabs) ***
+      // Format colonnes alignées sans pipes
+      const spacedTableMatch = row.raw.match(/^[\s]*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9\s\-\.\/\(\)]{4,}?)\s{2,}(\d{1,4})\s{2,}(pcs|ea|lot|set|kg|m|l|unit[es]?)[\s]*$/i);
+      if (spacedTableMatch) {
+        const desc = spacedTableMatch[1].trim();
+        const qty = parseInt(spacedTableMatch[2], 10);
+        const unit = spacedTableMatch[3]?.toLowerCase() || 'pcs';
+
+        if (desc.length >= 5 && qty > 0 && qty <= 10000 && !this.isNoiseLine(desc)) {
+          const brand = this.extractBrand(desc);
+
+          const tableItem: PriceRequestItem = {
+            description: desc.toUpperCase(),
+            quantity: qty,
+            unit: unit === 'ea' ? 'pcs' : unit,
+            brand,
+            isEmailTableItem: true,
+            originalLine: i,
+          };
+
+          items.push(tableItem);
+          lastItem = tableItem;
+          continuationsPerItem.set(tableItem, 0);
+          this.logger.debug(`Spaced table item at line ${i}: "${desc}" qty=${qty}`);
+          continue;
+        }
+      }
 
       const cells = row.cells.length > 1 ? row.cells : this.splitIntoCells(row.raw);
 
@@ -1180,6 +1336,125 @@ export class TableParserService implements OnModuleInit {
     let workingCells = cells;
     if (cells.length <= 2) {
       const combined = cells.join(' ').trim();
+
+      // *** Pattern pour listes à puces avec format (qty N) ***
+      // Supporte: *, -, •, ·, –, —, ►, ▪, ○, ●, ◆, ▸, ➤, ➢, ✓, ✔, >, », ⁃
+      // Ex: "* Filtre a huile 943343 (qty 3)" ou "  -   Filtre a gasoil 605013 (qty 3)"
+      const BULLET_CHARS = '[\\*\\-•·–—►▪○●◆▸➤➢✓✔>»⁃]';
+      const bulletQtyMatch = combined.match(new RegExp(`^[\\s]*${BULLET_CHARS}\\s*(.+?)\\s*\\(qty[:\\s]*(\\d+)\\)\\s*$`, 'i'));
+      if (bulletQtyMatch) {
+        const desc = bulletQtyMatch[1].trim();
+        const qty = parseInt(bulletQtyMatch[2], 10);
+
+        // Extraire le code fournisseur du texte (nombre à 5+ chiffres à la fin)
+        const supplierCodeMatch = desc.match(/\s+(\d{5,})\s*$/);
+        let finalDesc = desc;
+        let supplierCode: string | undefined;
+
+        if (supplierCodeMatch) {
+          supplierCode = supplierCodeMatch[1];
+          finalDesc = desc.substring(0, desc.lastIndexOf(supplierCode)).trim();
+        }
+
+        const brand = this.extractBrand(finalDesc);
+
+        return {
+          description: finalDesc.toUpperCase(),
+          quantity: qty,
+          unit: 'pcs',
+          supplierCode,
+          brand,
+          needsManualReview: false,
+          isEstimated: false,
+          isBulletListItem: true,  // Flag pour éviter la fusion
+          originalLine: rowIndex,
+        };
+      }
+
+      // *** Pattern pour listes à puces SANS format (qty N) - quantité par défaut = 1 ***
+      // Ex: "* Moteur complet" ou "  -   Filtre a huile boite 745878" ou "► Pompe hydraulique"
+      const bulletNoQtyMatch = combined.match(new RegExp(`^[\\s]*${BULLET_CHARS}\\s+(.+)$`));
+      if (bulletNoQtyMatch && !combined.toLowerCase().includes('(qty')) {
+        const desc = bulletNoQtyMatch[1].trim();
+
+        if (desc.length >= 5 && !desc.match(/^[-=_*►▪○●◆▸➤➢✓✔>»⁃]+$/)) {
+          const supplierCodeMatch = desc.match(/\s+(\d{5,})\s*$/);
+          let finalDesc = desc;
+          let supplierCode: string | undefined;
+
+          if (supplierCodeMatch) {
+            supplierCode = supplierCodeMatch[1];
+            finalDesc = desc.substring(0, desc.lastIndexOf(supplierCode)).trim();
+          }
+
+          const brand = this.extractBrand(finalDesc);
+
+          return {
+            description: finalDesc.toUpperCase(),
+            quantity: 1, // Quantité par défaut
+            unit: 'pcs',
+            supplierCode,
+            brand,
+            needsManualReview: true, // Flag car quantité estimée
+            isEstimated: true,
+            isBulletListItem: true,
+            originalLine: rowIndex,
+          };
+        }
+      }
+
+      // *** Pattern pour lignes de tableau email: "| Description | Qty | Unit |" ***
+      const tableCellMatch = combined.match(/^[\s]*\|?\s*([^|]+)\s*\|\s*(\d+)\s*\|\s*(pcs|ea|lot|set|kg|m|l|unit[es]?)?[\s|]*$/i);
+      if (tableCellMatch) {
+        const desc = tableCellMatch[1].trim();
+        const qty = parseInt(tableCellMatch[2], 10);
+        const unit = tableCellMatch[3]?.toLowerCase() || 'pcs';
+
+        if (desc.length >= 3 && qty > 0 && qty <= 10000 && !this.isNoiseLine(desc)) {
+          const supplierCodeMatch = desc.match(/\s+(\d{5,})\s*$/);
+          let finalDesc = desc;
+          let supplierCode: string | undefined;
+
+          if (supplierCodeMatch) {
+            supplierCode = supplierCodeMatch[1];
+            finalDesc = desc.substring(0, desc.lastIndexOf(supplierCode)).trim();
+          }
+
+          const brand = this.extractBrand(finalDesc);
+
+          return {
+            description: finalDesc.toUpperCase(),
+            quantity: qty,
+            unit: unit === 'ea' ? 'pcs' : unit,
+            supplierCode,
+            brand,
+            isEmailTableItem: true,
+            originalLine: rowIndex,
+          };
+        }
+      }
+
+      // *** Pattern alternatif tableau: "Description    Qty    Unit" (séparé par espaces/tabs) ***
+      const spacedTableMatch = combined.match(/^[\s]*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9\s\-\.\/\(\)]{4,}?)\s{2,}(\d{1,4})\s{2,}(pcs|ea|lot|set|kg|m|l|unit[es]?)[\s]*$/i);
+      if (spacedTableMatch) {
+        const desc = spacedTableMatch[1].trim();
+        const qty = parseInt(spacedTableMatch[2], 10);
+        const unit = spacedTableMatch[3]?.toLowerCase() || 'pcs';
+
+        if (desc.length >= 5 && qty > 0 && qty <= 10000 && !this.isNoiseLine(desc)) {
+          const brand = this.extractBrand(desc);
+
+          return {
+            description: desc.toUpperCase(),
+            quantity: qty,
+            unit: unit === 'ea' ? 'pcs' : unit,
+            brand,
+            isEmailTableItem: true,
+            originalLine: rowIndex,
+          };
+        }
+      }
+
       // Essayer de splitter avec différents patterns
       const reSplit = this.smartSplitLine(combined);
       if (reSplit.length > cells.length) {
@@ -1464,13 +1739,24 @@ export class TableParserService implements OnModuleInit {
     const processed: PriceRequestItem[] = [];
     const seen = new Set<string>();
 
+    this.logger.debug(`[DEBUG postProcess] Starting with ${items.length} items`);
+
     for (const item of items) {
+      const origDesc = item.description;
       // Nettoyer la description
       item.description = this.cleanDescription(item.description);
 
       // Skip si description trop courte ou invalide
-      if (!item.description || item.description.length < 5) continue;
-      if (this.isNoiseLine(item.description)) continue;
+      if (!item.description || item.description.length < 5) {
+        this.logger.debug(`[DEBUG postProcess] SKIP short desc: "${origDesc}" -> "${item.description}"`);
+        continue;
+      }
+
+      // Ne pas appliquer isNoiseLine aux items de liste à puces (déjà validés lors de l'extraction)
+      if (!item.isBulletListItem && this.isNoiseLine(item.description)) {
+        this.logger.debug(`[DEBUG postProcess] SKIP noise: "${item.description}"`);
+        continue;
+      }
 
       // Extraire la marque si pas déjà définie
       if (!item.brand) {
@@ -1489,9 +1775,13 @@ export class TableParserService implements OnModuleInit {
       // Déduplication par description + quantité
       const descKey = item.description.toLowerCase().replace(/\s+/g, ' ').substring(0, 60);
       const key = `${descKey}-${item.quantity}`;
-      if (seen.has(key)) continue;
+      if (seen.has(key)) {
+        this.logger.debug(`[DEBUG postProcess] SKIP duplicate: "${item.description}" qty=${item.quantity} key="${key}"`);
+        continue;
+      }
       seen.add(key);
 
+      this.logger.debug(`[DEBUG postProcess] KEEP: "${item.description}" qty=${item.quantity}`);
       processed.push(item);
     }
 
@@ -2294,6 +2584,11 @@ export class TableParserService implements OnModuleInit {
    * Vérifie si un item est "faible" (candidat à être rattaché)
    */
   private isWeakItem(item: PriceRequestItem): boolean {
+    // Ne jamais considérer les items de liste à puces comme faibles
+    if (item.isBulletListItem) {
+      return false;
+    }
+
     const hasCode = item.internalCode || item.supplierCode || item.reference;
     const hasQty = item.quantity && item.quantity > 0;
     const hasShortDesc = !item.description || item.description.length < 15;
@@ -2306,6 +2601,11 @@ export class TableParserService implements OnModuleInit {
    * Vérifie si deux items consécutifs devraient être fusionnés
    */
   private shouldMergeItems(current: PriceRequestItem, next: PriceRequestItem): boolean {
+    // Ne jamais fusionner les items de liste à puces
+    if (current.isBulletListItem || next.isBulletListItem) {
+      return false;
+    }
+
     // Même itemCode/partNumber
     const sameCode = (current.internalCode && current.internalCode === next.internalCode) ||
                      (current.supplierCode && current.supplierCode === next.supplierCode);

@@ -49,6 +49,28 @@ export class SchedulerController {
     return result;
   }
 
+  /**
+   * Retraitement exceptionnel des emails janvier 2026 (1-12)
+   * POST /scheduler/reprocess-january
+   */
+  @Post('reprocess-january')
+  async reprocessJanuary() {
+    const startDate = new Date('2026-01-01T00:00:00Z');
+    const endDate = new Date('2026-01-12T23:59:59Z');
+
+    const result = await this.schedulerService.reprocessDateRange(
+      startDate,
+      endDate,
+      ['INBOX'],
+    );
+
+    return {
+      success: !('error' in result),
+      period: { start: startDate, end: endDate },
+      result,
+    };
+  }
+
   @Put('config')
   async updateConfig(@Body() body: {
     endDate?: string;

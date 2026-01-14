@@ -826,58 +826,165 @@ export class PdfService {
 
   /**
    * Extraire les items depuis le corps de l'email
+   * Supporte: listes à puces, tableaux avec pipes, tableaux espacés
    */
   extractItemsFromEmailBody(body: string): PriceRequestItem[] {
     const items: PriceRequestItem[] = [];
-    
+
     if (!body) return items;
 
     const lines = body.split('\n').filter(l => l.trim());
 
-    // Patterns pour détecter des items dans un email
-    const patterns = [
-      // Pattern: Quantité x Description
-      /^(\d+)\s*[xX×]\s*(.{10,})/,
-      // Pattern: Description : Quantité
-      /^(.{10,}?)\s*:\s*(\d+)\s*(pcs?|unités?|ea)?/i,
-      // Pattern avec tiret
-      /^[-•]\s*(\d+)\s*[xX×]?\s*(.{10,})/,
-      // Pattern numéroté
-      /^\d+[.\)]\s*(.{10,}?)\s*[-–:]\s*(\d+)/,
-    ];
+    // Caractères de puce supportés: *, -, •, ·, –, —, ►, ▪, ○, ●, ◆, ▸, ➤, ➢, ✓, ✔, >, », ⁃
+    const BULLET_CHARS = '[\\*\\-•·–—►▪○●◆▸➤➢✓✔>»⁃]';
 
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed.length < 10 || trimmed.length > 500) continue;
+    for (let i = 0; i < lines.length; i++) {
+      const trimmed = lines[i].trim();
+      if (trimmed.length < 5 || trimmed.length > 500) continue;
 
-      for (const pattern of patterns) {
-        const match = trimmed.match(pattern);
-        if (match) {
-          let description: string;
-          let quantity: number;
+      // *** Pattern 1: Tableau avec pipes "| Description | Qty | Unit |" ***
+      const tableCellMatch = trimmed.match(/^\|?\s*([^|]+)\s*\|\s*(\d+)\s*\|\s*(pcs|ea|lot|set|kg|m|l|unit[es]?)?[\s|]*$/i);
+      if (tableCellMatch) {
+        const desc = tableCellMatch[1].trim();
+        const qty = parseInt(tableCellMatch[2], 10);
+        const unit = tableCellMatch[3]?.toLowerCase() || 'pcs';
 
-          if (pattern.source.startsWith('^(\\d+)')) {
-            // Quantité en premier
-            quantity = parseInt(match[1], 10);
-            description = match[2].trim();
-          } else {
-            // Description en premier
-            description = match[1].trim();
-            quantity = parseInt(match[2], 10) || 1;
-          }
+        if (desc.length >= 3 && qty > 0 && qty <= 10000 && !this.isHeaderLine(desc)) {
+          items.push({
+            description: desc.toUpperCase(),
+            quantity: qty,
+            unit: unit === 'ea' ? 'pcs' : unit,
+            brand: this.extractBrandFromDescription(desc),
+            isEmailTableItem: true,
+          });
+          continue;
+        }
+      }
 
-          if (description.length > 5 && quantity > 0) {
-            items.push({
-              description,
-              quantity,
-              unit: 'pcs',
-            });
-            break;
-          }
+      // *** Pattern 2: Tableau espacé "Description    Qty    Unit" ***
+      const spacedTableMatch = trimmed.match(/^([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9\s\-\.\/\(\)]{4,}?)\s{2,}(\d{1,4})\s{2,}(pcs|ea|lot|set|kg|m|l|unit[es]?)[\s]*$/i);
+      if (spacedTableMatch) {
+        const desc = spacedTableMatch[1].trim();
+        const qty = parseInt(spacedTableMatch[2], 10);
+        const unit = spacedTableMatch[3]?.toLowerCase() || 'pcs';
+
+        if (desc.length >= 5 && qty > 0 && qty <= 10000 && !this.isHeaderLine(desc)) {
+          items.push({
+            description: desc.toUpperCase(),
+            quantity: qty,
+            unit: unit === 'ea' ? 'pcs' : unit,
+            brand: this.extractBrandFromDescription(desc),
+            isEmailTableItem: true,
+          });
+          continue;
+        }
+      }
+
+      // *** Pattern 3: Bullet avec quantité "(qty N)" ***
+      const bulletQtyMatch = trimmed.match(new RegExp(`^${BULLET_CHARS}\\s*(.+?)\\s*\\(qty[:\\s]*(\\d+)\\)\\s*$`, 'i'));
+      if (bulletQtyMatch) {
+        const desc = bulletQtyMatch[1].trim();
+        const qty = parseInt(bulletQtyMatch[2], 10);
+
+        if (desc.length >= 5 && qty > 0) {
+          items.push({
+            description: desc.toUpperCase(),
+            quantity: qty,
+            unit: 'pcs',
+            brand: this.extractBrandFromDescription(desc),
+            isBulletListItem: true,
+          });
+          continue;
+        }
+      }
+
+      // *** Pattern 4: Bullet SANS quantité - qty=1 par défaut ***
+      const bulletNoQtyMatch = trimmed.match(new RegExp(`^${BULLET_CHARS}\\s+(.+)$`));
+      if (bulletNoQtyMatch && !trimmed.toLowerCase().includes('(qty')) {
+        const desc = bulletNoQtyMatch[1].trim();
+
+        // Ignorer les séparateurs et lignes trop courtes
+        if (desc.length >= 5 && !desc.match(/^[-=_*►▪○●◆▸➤➢✓✔>»⁃]+$/)) {
+          items.push({
+            description: desc.toUpperCase(),
+            quantity: 1, // Quantité par défaut
+            unit: 'pcs',
+            brand: this.extractBrandFromDescription(desc),
+            isBulletListItem: true,
+            isEstimated: true,
+            needsManualReview: true,
+          });
+          continue;
+        }
+      }
+
+      // *** Pattern 5: Quantité x Description (ex: "5 x Filtre à huile") ***
+      const qtyFirstMatch = trimmed.match(/^(\d+)\s*[xX×]\s*(.{5,})/);
+      if (qtyFirstMatch) {
+        const qty = parseInt(qtyFirstMatch[1], 10);
+        const desc = qtyFirstMatch[2].trim();
+
+        if (qty > 0 && qty <= 10000 && desc.length >= 5) {
+          items.push({
+            description: desc.toUpperCase(),
+            quantity: qty,
+            unit: 'pcs',
+            brand: this.extractBrandFromDescription(desc),
+          });
+          continue;
+        }
+      }
+
+      // *** Pattern 6: Description : Quantité (ex: "Filtre à huile : 5") ***
+      const descFirstMatch = trimmed.match(/^(.{5,}?)\s*:\s*(\d+)\s*(pcs?|unités?|ea|lot)?/i);
+      if (descFirstMatch) {
+        const desc = descFirstMatch[1].trim();
+        const qty = parseInt(descFirstMatch[2], 10) || 1;
+        const unit = descFirstMatch[3]?.toLowerCase() || 'pcs';
+
+        if (desc.length >= 5 && qty > 0 && qty <= 10000 && !this.isHeaderLine(desc)) {
+          items.push({
+            description: desc.toUpperCase(),
+            quantity: qty,
+            unit: unit === 'ea' ? 'pcs' : unit,
+            brand: this.extractBrandFromDescription(desc),
+          });
+          continue;
+        }
+      }
+
+      // *** Pattern 7: Numéroté (ex: "1. Filtre à huile - 5" ou "1) Pompe - 3") ***
+      const numberedMatch = trimmed.match(/^\d+[.\)]\s*(.{5,}?)\s*[-–:]\s*(\d+)/);
+      if (numberedMatch) {
+        const desc = numberedMatch[1].trim();
+        const qty = parseInt(numberedMatch[2], 10) || 1;
+
+        if (desc.length >= 5 && qty > 0 && qty <= 10000) {
+          items.push({
+            description: desc.toUpperCase(),
+            quantity: qty,
+            unit: 'pcs',
+            brand: this.extractBrandFromDescription(desc),
+          });
+          continue;
         }
       }
     }
 
     return items;
+  }
+
+  /**
+   * Vérifie si une ligne est un header de tableau
+   */
+  private isHeaderLine(text: string): boolean {
+    const headers = [
+      /^(description|désignation|article|item|produit)$/i,
+      /^(qty|quantit[ée]|qté)$/i,
+      /^(unit[ée]?|uom|u\.m\.)$/i,
+      /^(prix|price|tarif)$/i,
+      /^(référence|reference|ref\.?)$/i,
+    ];
+    return headers.some(h => h.test(text.trim()));
   }
 }

@@ -238,4 +238,44 @@ export class SchedulerService implements OnModuleInit {
       nextExecution: this.isActive ? new Date(Date.now() + this.intervalMinutes * 60 * 1000) : null,
     };
   }
+
+  /**
+   * Retraitement exceptionnel des emails sur une plage de dates
+   * Utilisé pour le retraitement janvier 2026
+   */
+  async reprocessDateRange(
+    startDate: Date,
+    endDate: Date,
+    folders: string[] = ['INBOX'],
+  ): Promise<ProcessResult | { error: string }> {
+    if (this.isProcessing) {
+      this.logger.warn('Traitement déjà en cours, retraitement ignoré');
+      return { error: 'Traitement en cours' };
+    }
+
+    this.isProcessing = true;
+    this.logger.log(`=== RETRAITEMENT EXCEPTIONNEL ===`);
+    this.logger.log(`Période: ${startDate.toISOString()} - ${endDate.toISOString()}`);
+    this.logger.log(`Dossiers: ${folders.join(', ')}`);
+
+    try {
+      const result = await this.autoProcessor.processNewEmails({
+        startDate,
+        endDate,
+        folders,
+        autoSendDraft: true,
+      });
+
+      this.logger.log(`=== RETRAITEMENT TERMINE ===`);
+      this.logger.log(`Traités: ${result.processed}, Réussis: ${result.successful}, Échecs: ${result.failed}, Ignorés: ${result.skipped}`);
+
+      return result;
+
+    } catch (error) {
+      this.logger.error('Erreur retraitement:', error.message);
+      return { error: error.message };
+    } finally {
+      this.isProcessing = false;
+    }
+  }
 }

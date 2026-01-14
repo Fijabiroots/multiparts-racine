@@ -505,6 +505,31 @@ export class ParseLogService {
   }
 
   /**
+   * Update an existing parse log with LLM comparison data
+   */
+  async updateLlmComparison(
+    requestId: string,
+    llmComparison: ParseLog['llmComparison'],
+  ): Promise<boolean> {
+    const log = await this.loadLog(requestId);
+    if (!log) {
+      this.logger.warn(`Parse log not found for ${requestId}, cannot update LLM comparison`);
+      return false;
+    }
+
+    log.llmComparison = llmComparison;
+
+    try {
+      await this.saveLog(log);
+      this.logger.log(`Updated parse log ${requestId} with LLM comparison data`);
+      return true;
+    } catch (error) {
+      this.logger.error(`Failed to update parse log with LLM data: ${error.message}`);
+      return false;
+    }
+  }
+
+  /**
    * Ensure output directory exists
    */
   private ensureOutputDir(): void {

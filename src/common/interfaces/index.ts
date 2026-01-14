@@ -49,6 +49,8 @@ export interface PriceRequestItem {
   needsManualReview?: boolean;  // true si quantité/infos à vérifier manuellement
   isEstimated?: boolean;        // true si quantité estimée (non lue du document)
   originalLine?: number;        // Numéro de ligne dans le document original
+  isBulletListItem?: boolean;   // true si extrait d'une liste à puces - évite la fusion
+  isEmailTableItem?: boolean;   // true si extrait d'un tableau dans le corps de l'email
   // LLM Parser fields
   unitPrice?: number;           // Prix unitaire
   totalPrice?: number;          // Prix total ligne
