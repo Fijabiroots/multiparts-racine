@@ -132,8 +132,16 @@ export class EmailExtractorService {
     text = text.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
     text = text.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
 
+    // Convert list items to bullet points (preserve the bullet for pattern matching)
+    // Handle <li> with a bullet character before converting other elements
+    text = text.replace(/<li[^>]*>/gi, '\n* ');
+    text = text.replace(/<\/li>/gi, '');
+
+    // Remove list container tags
+    text = text.replace(/<\/?(ul|ol)[^>]*>/gi, '\n');
+
     // Convert block elements to newlines
-    text = text.replace(/<\/?(div|p|br|tr|li|h\d)[^>]*>/gi, '\n');
+    text = text.replace(/<\/?(div|p|br|tr|h\d)[^>]*>/gi, '\n');
 
     // Convert table cells to tabs
     text = text.replace(/<\/?(td|th)[^>]*>/gi, '\t');
@@ -243,6 +251,9 @@ export class EmailExtractorService {
     const tables: string[][][] = [];
     const lines = text.split('\n');
 
+    // Bullet characters pattern - lines starting with these are NOT table rows
+    const BULLET_PATTERN = /^\s*[\*\-•·–—►▪○●◆▸➤➢✓✔>»⁃]/;
+
     // Look for tab-delimited or fixed-width tables
     let currentTable: string[][] = [];
     let prevColumnCount = 0;
@@ -251,6 +262,17 @@ export class EmailExtractorService {
       const trimmed = line.trim();
       if (!trimmed) {
         // Empty line - end current table if exists
+        if (currentTable.length > 1) {
+          tables.push([...currentTable]);
+        }
+        currentTable = [];
+        prevColumnCount = 0;
+        continue;
+      }
+
+      // Skip bullet list items - they're not table rows
+      if (BULLET_PATTERN.test(line)) {
+        // End current table if exists
         if (currentTable.length > 1) {
           tables.push([...currentTable]);
         }
