@@ -128,14 +128,11 @@ export class BrandMatcherService implements OnModuleInit {
     }
 
     // 3. Chercher dans le corps (confiance moyenne)
-    // CORRECTION: Nettoyer le body avant le matching pour éviter les faux positifs
     if (email.bodyText) {
-      const cleanedBody = this.cleanBodyForBrandMatching(email.bodyText);
-
       for (const brand of this.brands) {
         if (matchedBrands.has(brand.name)) continue;
 
-        const bodyMatch = this.findMatch(cleanedBody, brand);
+        const bodyMatch = this.findMatch(email.bodyText, brand);
         if (bodyMatch) {
           matches.push({
             brandName: brand.name,
@@ -150,86 +147,6 @@ export class BrandMatcherService implements OnModuleInit {
     }
 
     return matches;
-  }
-
-  /**
-   * Nettoie le corps de l'email avant le matching de marques
-   * Supprime signatures, disclaimers, citations pour éviter les faux positifs
-   */
-  private cleanBodyForBrandMatching(text: string): string {
-    if (!text) return '';
-
-    let cleaned = text;
-
-    // Limiter à 8000 caractères (le contenu pertinent est généralement au début)
-    cleaned = cleaned.substring(0, 8000);
-
-    // Supprimer les signatures email courantes
-    const signaturePatterns = [
-      /^--\s*$/m,                                    // -- séparateur de signature
-      /^_{3,}$/m,                                    // ___ séparateur
-      /^-{3,}$/m,                                    // --- séparateur
-      /^Cordialement[,.]?\s*$/im,                    // Cordialement
-      /^Best regards[,.]?\s*$/im,                    // Best regards
-      /^Kind regards[,.]?\s*$/im,                    // Kind regards
-      /^Sincèrement[,.]?\s*$/im,                     // Sincèrement
-      /^Bien à vous[,.]?\s*$/im,                     // Bien à vous
-      /^Sent from my (iPhone|iPad|Android)/im,      // Mobile signatures
-      /^Envoyé depuis mon/im,                        // French mobile
-    ];
-
-    for (const pattern of signaturePatterns) {
-      const match = cleaned.match(pattern);
-      if (match && match.index !== undefined) {
-        // Couper à partir de la signature
-        cleaned = cleaned.substring(0, match.index);
-      }
-    }
-
-    // Supprimer les disclaimers légaux
-    const disclaimerPatterns = [
-      /CONFIDENTIAL.*?intended recipient/is,
-      /Ce message.*?strictement confidentiel/is,
-      /This email.*?confidential/is,
-      /AVIS DE CONFIDENTIALITÉ/i,
-      /DISCLAIMER:/i,
-      /P\s*Please consider the environment/i,
-    ];
-
-    for (const pattern of disclaimerPatterns) {
-      cleaned = cleaned.replace(pattern, '');
-    }
-
-    // Supprimer les citations d'emails précédents
-    const citationPatterns = [
-      /^>+.*$/gm,                                    // > citations
-      /^On .* wrote:$/gm,                           // On ... wrote:
-      /^Le .* a écrit.*:$/gm,                       // Le ... a écrit :
-      /^De\s*:.*$/gm,                               // De: (from headers)
-      /^From\s*:.*$/gm,                             // From:
-      /^Envoyé\s*:.*$/gm,                           // Envoyé:
-      /^À\s*:.*$/gm,                                // À:
-      /^Objet\s*:.*$/gm,                            // Objet:
-    ];
-
-    for (const pattern of citationPatterns) {
-      cleaned = cleaned.replace(pattern, '');
-    }
-
-    // Supprimer les titres de postes courants (source de faux positifs)
-    const jobTitlePatterns = [
-      /\b(Directeur|Director|Manager|Chef de|Head of|VP|Vice President)\s+\w+/gi,
-      /\b(Responsable|Chargé de|Assistant|Coordinateur)\s+\w+/gi,
-      /\bTel\s*[:.]?\s*[\d\s\+\-\.]+/gi,
-      /\bFax\s*[:.]?\s*[\d\s\+\-\.]+/gi,
-      /\bMobile\s*[:.]?\s*[\d\s\+\-\.]+/gi,
-    ];
-
-    for (const pattern of jobTitlePatterns) {
-      cleaned = cleaned.replace(pattern, '');
-    }
-
-    return cleaned.trim();
   }
 
   /**

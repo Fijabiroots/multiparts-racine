@@ -27,7 +27,6 @@ export interface ClassificationResult {
   classification: MessageClassification;
   score: number;
   reasons: string[];
-  confidence?: number;  // 0.0-1.0, higher = more certain
 }
 
 export interface ScoringRule {

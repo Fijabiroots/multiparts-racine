@@ -61,6 +61,7 @@ export class EmailService {
   async fetchEmails(filter: EmailFilterDto): Promise<ParsedEmail[]> {
     const connection = await this.connect();
     const folder = filter.folder || 'INBOX';
+    const timeout = filter.timeout || 60000; // Default 60s timeout
 
     try {
       await connection.openBox(folder);
@@ -78,26 +79,62 @@ export class EmailService {
         searchCriteria.push(['SUBJECT', filter.subject]);
       }
       // Filtres de date IMAP (SINCE = à partir de, BEFORE = avant)
+      // IMAP requires dates in format DD-Mon-YYYY (e.g., 01-Jan-2024)
       if (filter.since) {
-        searchCriteria.push(['SINCE', filter.since]);
+        const sinceDate = filter.since instanceof Date ? filter.since : new Date(filter.since);
+        searchCriteria.push(['SINCE', this.formatImapDate(sinceDate)]);
       }
       if (filter.before) {
-        searchCriteria.push(['BEFORE', filter.before]);
+        const beforeDate = filter.before instanceof Date ? filter.before : new Date(filter.before);
+        searchCriteria.push(['BEFORE', this.formatImapDate(beforeDate)]);
       }
 
+      // Step 1: Search for UIDs only (lightweight operation)
+      const uidFetchOptions = {
+        bodies: [],
+        struct: false,
+        markSeen: false,
+      };
+
+      const allMessages = await this.withTimeout<any[]>(
+        connection.search(searchCriteria, uidFetchOptions),
+        timeout,
+        'IMAP search timeout',
+      );
+
+      this.logger.log(`Found ${allMessages.length} messages in ${folder}`);
+
+      if (allMessages.length === 0) {
+        return [];
+      }
+
+      // Step 2: Apply limit BEFORE fetching full bodies (memory optimization)
+      // If no limit specified (0 or undefined), fetch ALL messages
+      const limit = filter.limit;
+      const messagesToFetch = (limit && limit > 0)
+        ? allMessages.slice(-limit)
+        : allMessages;
+
+      const limitedUids = messagesToFetch.map((m: any) => m.attributes.uid);
+
+      this.logger.log(`Fetching ${limitedUids.length} emails from ${folder}...`);
+
+      // Step 3: Fetch full bodies only for selected UIDs
       const fetchOptions = {
         bodies: ['HEADER', 'TEXT', ''],
         struct: true,
         markSeen: false,
       };
 
-      const messages = await connection.search(searchCriteria, fetchOptions);
-      const limit = filter.limit || 10;
-      const limitedMessages = messages.slice(-limit);
+      const messages = await this.withTimeout<any[]>(
+        connection.search([['UID', limitedUids.join(',')]], fetchOptions),
+        timeout,
+        'IMAP fetch timeout',
+      );
 
       const parsedEmails: ParsedEmail[] = [];
 
-      for (const message of limitedMessages) {
+      for (const message of messages) {
         const parsed = await this.parseMessage(message);
         if (parsed) {
           parsedEmails.push(parsed);
@@ -108,6 +145,36 @@ export class EmailService {
     } finally {
       connection.end();
     }
+  }
+
+  /**
+   * Wrap a promise with a timeout
+   */
+  private async withTimeout<T>(promise: Promise<T>, ms: number, errorMsg: string): Promise<T> {
+    let timeoutId: NodeJS.Timeout;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutId = setTimeout(() => reject(new Error(errorMsg)), ms);
+    });
+
+    try {
+      const result = await Promise.race([promise, timeoutPromise]);
+      clearTimeout(timeoutId!);
+      return result;
+    } catch (error) {
+      clearTimeout(timeoutId!);
+      throw error;
+    }
+  }
+
+  /**
+   * Format a Date object to IMAP date format (DD-Mon-YYYY)
+   */
+  private formatImapDate(date: Date): string {
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const day = date.getDate();
+    const month = months[date.getMonth()];
+    const year = date.getFullYear();
+    return `${day}-${month}-${year}`;
   }
 
   async fetchEmailById(emailId: string, folder = 'INBOX'): Promise<ParsedEmail | null> {

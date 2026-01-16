@@ -78,4 +78,8 @@ export class EmailFilterDto {
 
   @IsOptional()
   before?: Date;
+
+  @IsOptional()
+  @IsNumber()
+  timeout?: number;
 }

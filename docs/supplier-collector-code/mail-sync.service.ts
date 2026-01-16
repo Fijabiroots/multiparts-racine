@@ -21,11 +21,8 @@ import { ParsedEmail } from '../../common/interfaces';
  * MailSyncService
  *
  * Orchestrateur principal du module Supplier Collector.
- * Synchronise les emails depuis INBOX UNIQUEMENT, classifie les réponses fournisseurs,
+ * Synchronise les emails depuis SENT et INBOX, classifie les réponses fournisseurs,
  * et met à jour l'annuaire Marque → Fournisseurs.
- *
- * IMPORTANT: Seuls les emails REÇUS (INBOX) alimentent l'annuaire.
- * Les emails SENT sont nos RFQ sortantes et ne représentent PAS des offres fournisseurs.
  */
 @Injectable()
 export class MailSyncService {
@@ -34,8 +31,8 @@ export class MailSyncService {
   private lastSyncResult: SyncResult | null = null;
   private accountEmail: string;
 
-  // CORRECTION: Sync UNIQUEMENT INBOX - les emails SENT sont nos demandes sortantes
-  private readonly folders: string[] = ['INBOX'];
+  // Folders à synchroniser (IMAP paths)
+  private readonly folders: string[] = ['INBOX', 'INBOX/Sent'];
 
   // Domaines internes à ignorer
   private readonly internalDomains = ['multipartsci.com', 'multiparts.ci'];
@@ -157,7 +154,6 @@ export class MailSyncService {
           await this.updateClassification(syncedEmail.id, classification);
 
           // Si c'est une offre, chercher les marques et mettre à jour l'annuaire
-          // CORRECTION CRITIQUE: Uniquement pour les emails INBOX (pas SENT)
           if (classification.classification === MessageClassification.OFFER) {
             result.offersDetected++;
 
@@ -166,23 +162,19 @@ export class MailSyncService {
             if (brandMatches.length > 0) {
               result.brandsMatched += brandMatches.length;
 
-              // CORRECTION: Ne mettre à jour l'annuaire QUE pour INBOX
-              // Les emails SENT sont nos RFQ sortantes, pas des offres fournisseurs
-              if (folderType === 'INBOX') {
-                // Pour INBOX: l'expéditeur (fromEmail) EST le fournisseur
-                const supplierEmail = syncedEmail.fromEmail;
-                const supplierName = syncedEmail.fromName;
+              // Déterminer l'email fournisseur
+              const supplierEmail = this.extractSupplierEmail(syncedEmail, folderType);
+              const supplierName = this.extractSupplierName(syncedEmail, folderType);
 
-                // Ajouter à l'annuaire
-                for (const match of brandMatches) {
-                  await this.directoryService.upsertBrandSupplier(
-                    match,
-                    supplierEmail,
-                    supplierName,
-                    syncedEmail.id,
-                    classification.reasons,
-                  );
-                }
+              // Ajouter à l'annuaire
+              for (const match of brandMatches) {
+                await this.directoryService.upsertBrandSupplier(
+                  match,
+                  supplierEmail,
+                  supplierName,
+                  syncedEmail.id,
+                  classification.reasons,
+                );
               }
             }
           }
@@ -290,17 +282,14 @@ export class MailSyncService {
         const allFolders = await this.emailService.listFolders();
         this.logger.log(`All IMAP folders: ${allFolders.join(', ')}`);
 
-        // CORRECTION: Filtrer pour inclure UNIQUEMENT INBOX et archives d'INBOX
-        // Les dossiers SENT/Envoyés contiennent nos RFQ sortantes, PAS des offres fournisseurs
+        // Filtrer pour inclure INBOX, SENT, et les archives
         // Note: les noms de dossiers sont normalisés avec /
         const relevantFolders = allFolders.filter(f => {
           const lower = f.toLowerCase();
-          // Exclure explicitement SENT/Envoyés
-          if (lower.includes('sent') || lower.includes('envoy')) {
-            return false;
-          }
           return (
             lower === 'inbox' ||
+            lower.includes('sent') ||
+            lower.includes('envoy') ||
             lower.includes('archive')
           );
         });
@@ -477,10 +466,6 @@ export class MailSyncService {
         const classification = this.classifierService.classify(syncedEmail);
         await this.updateClassification(syncedEmail.id, classification);
 
-        // CORRECTION CRITIQUE: Ne mettre à jour l'annuaire QUE pour INBOX
-        // Les emails SENT sont nos RFQ sortantes, pas des offres fournisseurs
-        const isInbox = folderType === 'INBOX';
-
         if (classification.classification === MessageClassification.OFFER) {
           result.offersDetected++;
 
@@ -489,21 +474,17 @@ export class MailSyncService {
           if (brandMatches.length > 0) {
             result.brandsMatched += brandMatches.length;
 
-            // Mettre à jour l'annuaire UNIQUEMENT pour INBOX
-            if (isInbox) {
-              // Pour INBOX: l'expéditeur (fromEmail) EST le fournisseur
-              const supplierEmail = syncedEmail.fromEmail;
-              const supplierName = syncedEmail.fromName;
+            const supplierEmail = this.extractSupplierEmail(syncedEmail, folderType);
+            const supplierName = this.extractSupplierName(syncedEmail, folderType);
 
-              for (const match of brandMatches) {
-                await this.directoryService.upsertBrandSupplier(
-                  match,
-                  supplierEmail,
-                  supplierName,
-                  syncedEmail.id,
-                  classification.reasons,
-                );
-              }
+            for (const match of brandMatches) {
+              await this.directoryService.upsertBrandSupplier(
+                match,
+                supplierEmail,
+                supplierName,
+                syncedEmail.id,
+                classification.reasons,
+              );
             }
           }
         }
@@ -538,7 +519,6 @@ export class MailSyncService {
 
   /**
    * Retraite les emails non classifiés
-   * CORRECTION: Vérifie le folder avant de mettre à jour l'annuaire
    */
   async reprocessUnclassified(): Promise<number> {
     const result = this.databaseService['db'].exec(`
@@ -560,15 +540,10 @@ export class MailSyncService {
       const classification = this.classifierService.classify(email);
       await this.updateClassification(email.id, classification);
 
-      // CORRECTION: Vérifier que c'est un email INBOX avant d'alimenter l'annuaire
-      const isInbox = email.folder === 'INBOX' || email.folder.toUpperCase().includes('INBOX');
-
-      if (isInbox && classification.classification === MessageClassification.OFFER) {
+      if (classification.classification === MessageClassification.OFFER) {
         const brandMatches = this.brandMatcherService.findBrandsInEmail(email);
-
-        // Pour INBOX: l'expéditeur (fromEmail) EST le fournisseur
-        const supplierEmail = email.fromEmail;
-        const supplierName = email.fromName;
+        const supplierEmail = this.extractSupplierEmail(email, email.folder);
+        const supplierName = this.extractSupplierName(email, email.folder);
 
         for (const match of brandMatches) {
           await this.directoryService.upsertBrandSupplier(
